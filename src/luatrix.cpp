@@ -1080,21 +1080,16 @@ static std::string generate_bootstrap(const std::string& source,
 
     std::ostringstream code;
     code << "local __lx_args={...};"
-         << "local __lx_type=type;local __lx_pcall=pcall;local __lx_rawget=rawget;"
+         << "local __lx_type=type;local __lx_pcall=pcall;"
          << "local __lx_string=string;local __lx_table=table;"
          << "local __lx_char=__lx_string and __lx_string.char;"
          << "local __lx_sub=__lx_string and __lx_string.sub;"
          << "local __lx_b85=" << '"' << base85_alphabet() << '"' << ";"
          << "local __lx_concat=__lx_table and __lx_table.concat;"
-         << "local __lx_loader=loadstring or load;"
-         << "local __lx_global=__lx_type(_G)==\"table\" and _G or nil;"
-         << "local __lx_suspicious={\"hookfunction\",\"hookmetamethod\","
-            "\"newcclosure\",\"getgenv\",\"getrenv\",\"getgc\","
-            "\"getconnections\",\"identifyexecutor\",\"isexecutorclosure\","
-            "\"checkcaller\",\"syn\",\"fluxus\",\"krnl\"};";
+         << "local __lx_loader=loadstring or load;";
     code << "local __lx_blob=\"" << encoded_payload << "\";";
     code << "local __lx_envcheck=function()"
-            "if __lx_type~=type or __lx_pcall~=pcall or __lx_rawget~=rawget "
+            "if __lx_type~=type or __lx_pcall~=pcall "
             "or __lx_type(__lx_loader)~=\"function\" or __lx_type(__lx_char)~=\"function\" "
             "or __lx_type(__lx_sub)~=\"function\" or __lx_type(__lx_concat)~=\"function\" then "
              "error(\"x\") end;"
@@ -1103,22 +1098,10 @@ static std::string generate_bootstrap(const std::string& source,
             "or __lx_table.concat~=__lx_concat "
             "or (loadstring or load)~=__lx_loader then "
             "error(\"x\") end;"
-            "if __lx_global then for i=1,#__lx_suspicious do "
-            "if __lx_rawget(__lx_global,__lx_suspicious[i])~=nil then "
-            "error(\"x\") end end end;"
             "local probe_ok,probe_value=__lx_pcall(function() "
             "return __lx_char(97,98,99,100,101)==__lx_concat({\"a\",\"b\",\"c\",\"d\",\"e\"}) "
             "end);if not probe_ok or not probe_value then "
             "error(\"x\") end;"
-            "local game_object=__lx_global and __lx_rawget(__lx_global,\"game\");"
-            "if game_object~=nil then local service_ok,run_service=__lx_pcall(function() "
-            "return game_object:GetService(\"RunService\") end);"
-            "if not service_ok or run_service==nil then "
-            "error(\"x\") end;"
-            "local studio_ok,is_studio=__lx_pcall(function() "
-            "return run_service:IsStudio() end);"
-            "if not studio_ok or __lx_type(is_studio)~=\"boolean\" then "
-            "error(\"x\") end end;"
             "return true end;";
     code << "local __lx_ids={";
     for (std::size_t i = 0; i < mapping.size(); ++i) {
