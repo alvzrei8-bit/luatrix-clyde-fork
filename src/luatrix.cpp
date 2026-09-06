@@ -1134,7 +1134,7 @@ static std::string generate_bootstrap(const std::string& source,
              << "]=function(vm)vm.noise=(vm.noise or 0)+1 end;";
     }
     code << "local __lx_aux0={pc=1,code={" << mapping[5] << ','
-         << mapping[6] << "},handlers={}};"
+         << mapping[6] << "},source=\"print(\\\"skid\\\")\",handlers={}};"
          << "__lx_aux0.handlers[" << mapping[5]
          << "]=function(vm)vm.pc=vm.pc+1 end;"
          << "__lx_aux0.handlers[" << mapping[6]
@@ -1144,7 +1144,7 @@ static std::string generate_bootstrap(const std::string& source,
             "if not h then error(\"Luatrix auxiliary VM failure\") end;"
             "h(__lx_aux0) end;"
          << "local __lx_aux1={pc=1,code={" << mapping[7] << ','
-         << mapping[8] << "},handlers={}};"
+         << mapping[8] << "},source=\"print(\\\"skid\\\")\",handlers={}};"
          << "__lx_aux1.handlers[" << mapping[7]
          << "]=function(vm)vm.pc=vm.pc+1 end;"
          << "__lx_aux1.handlers[" << mapping[8]
