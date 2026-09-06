@@ -1212,7 +1212,7 @@ static std::string generate_bootstrap(const std::string& source,
               << "if __lx_type(cell)~=\"table\" or __lx_type(cell[1])~=\"number\" "
                  "or cell[2]~=i then error(\"x\") end;"
               << "local decoded=__lx_xor(cell[1],vm.mutation);"
-              << "ca=(ca*65599+decoded+cell[2]*17+i)%1000003 end;"
+              << "ca=(ca*65599+decoded+cell[2]*17)%1000003 end;"
               << "ca=(ca*65599+vm.model)%1000003;"
               << "if ca~=vm.codeTag then error(\"x\") end;";
         return guard.str();
