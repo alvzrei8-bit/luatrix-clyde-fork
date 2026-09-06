@@ -979,33 +979,43 @@ static std::string scramble_control_flow(std::vector<Token> tokens, std::uint64_
     return join_tokens(tokens);
 }
 
-static std::vector<unsigned char> rle_compress(const std::string& source) {
-    std::vector<unsigned char> encoded;
-    for (std::size_t i = 0; i < source.size();) {
-        const unsigned char value = static_cast<unsigned char>(source[i]);
-        std::size_t count = 1;
-        while (i + count < source.size() &&
-               static_cast<unsigned char>(source[i + count]) == value && count < 255) {
-            ++count;
+static std::vector<unsigned> lzw_compress(const std::string& source) {
+    std::unordered_map<std::string, unsigned> dictionary;
+    for (unsigned i = 0; i < 256; ++i) {
+        dictionary.emplace(std::string(1, static_cast<char>(i)), i);
+    }
+
+    std::vector<unsigned> encoded;
+    std::string current;
+    unsigned next_code = 256;
+    for (unsigned char value : source) {
+        std::string candidate = current;
+        candidate.push_back(static_cast<char>(value));
+        if (dictionary.find(candidate) != dictionary.end()) {
+            current = std::move(candidate);
+            continue;
         }
-        if (count >= 4 || value == 255) {
-            encoded.push_back(255);
-            encoded.push_back(static_cast<unsigned char>(count));
-            encoded.push_back(value);
-        } else {
-            for (std::size_t j = 0; j < count; ++j) encoded.push_back(value);
+
+        if (!current.empty()) {
+            encoded.push_back(dictionary.at(current));
         }
-        i += count;
+        if (next_code <= 65535U) {
+            dictionary.emplace(std::move(candidate), next_code++);
+        }
+        current.assign(1, static_cast<char>(value));
+    }
+    if (!current.empty()) {
+        encoded.push_back(dictionary.at(current));
     }
     return encoded;
 }
 
-static std::string lua_array(const std::vector<unsigned char>& data) {
+static std::string lua_array(const std::vector<unsigned>& data) {
     std::ostringstream output;
     output << '{';
     for (std::size_t i = 0; i < data.size(); ++i) {
         if (i != 0) output << ',';
-        output << static_cast<unsigned>(data[i]);
+        output << data[i];
     }
     output << '}';
     return output.str();
@@ -1024,14 +1034,14 @@ static std::string generate_bootstrap(const std::string& source,
                                       std::mt19937_64& rng) {
     const unsigned guard_seed = static_cast<unsigned>(rng() % 97U) + 3U;
     const std::vector<unsigned> mapping = randomized_opcodes(32, rng);
-    std::vector<unsigned char> compressed = rle_compress(source);
-    const unsigned payload_key = static_cast<unsigned>(rng() % 251U) + 1U;
-    std::vector<unsigned char> encrypted = compressed;
+    const std::vector<unsigned> compressed = lzw_compress(source);
+    const unsigned payload_key = static_cast<unsigned>(rng() % 4093U) + 1U;
+    std::vector<unsigned> encrypted = compressed;
     for (std::size_t i = 0; i < encrypted.size(); ++i) {
         const unsigned mask = (payload_key +
-                               static_cast<unsigned>((i * 31U) % 251U)) & 0xffU;
-        encrypted[i] = static_cast<unsigned char>(
-            static_cast<unsigned>(encrypted[i]) ^ mask);
+                               static_cast<unsigned>((i * 31U) % 4093U)) %
+                              4096U;
+        encrypted[i] = encrypted[i] ^ mask;
     }
 
     constexpr unsigned checksum_modulus = 1000003U;
@@ -1064,6 +1074,7 @@ static std::string generate_bootstrap(const std::string& source,
          << "local __lx_type=type;local __lx_pcall=pcall;local __lx_rawget=rawget;"
          << "local __lx_string=string;local __lx_table=table;"
          << "local __lx_char=__lx_string and __lx_string.char;"
+         << "local __lx_sub=__lx_string and __lx_string.sub;"
          << "local __lx_concat=__lx_table and __lx_table.concat;"
          << "local __lx_loader=loadstring or load;"
          << "local __lx_global=__lx_type(_G)==\"table\" and _G or nil;"
@@ -1075,10 +1086,11 @@ static std::string generate_bootstrap(const std::string& source,
     code << "local __lx_envcheck=function()"
             "if __lx_type~=type or __lx_pcall~=pcall or __lx_rawget~=rawget "
             "or __lx_type(__lx_loader)~=\"function\" or __lx_type(__lx_char)~=\"function\" "
-            "or __lx_type(__lx_concat)~=\"function\" then "
+            "or __lx_type(__lx_sub)~=\"function\" or __lx_type(__lx_concat)~=\"function\" then "
             "error(\"Luatrix anti-tamper failure\") end;"
             "if __lx_string~=string or __lx_table~=table or "
-            "__lx_string.char~=__lx_char or __lx_table.concat~=__lx_concat "
+            "__lx_string.char~=__lx_char or __lx_string.sub~=__lx_sub "
+            "or __lx_table.concat~=__lx_concat "
             "or (loadstring or load)~=__lx_loader then "
             "error(\"Luatrix anti-tamper failure\") end;"
             "if __lx_global then for i=1,#__lx_suspicious do "
@@ -1113,14 +1125,34 @@ static std::string generate_bootstrap(const std::string& source,
     code << "local __lx_xor=function(a,b)local r,p=0,1;while a>0 or b>0 do "
             "local x,y=a%2,b%2;if x~=y then r=r+p end;"
             "a=(a-x)/2;b=(b-y)/2;p=p*2 end;return r end;";
-    code << "local __lx_byte=function(pos)local mask=("
-         << "__lx_vm.key+((pos-1)*31)%251)%256;return __lx_xor("
+    code << "local __lx_word=function(pos)local mask=("
+         << "__lx_vm.key+((pos-1)*31)%4093)%4096;return __lx_xor("
          << "__lx_vm.blob[pos],mask)end;";
     code << "local __lx_handlers={};";
     for (unsigned id : mapping) {
         code << "__lx_handlers[" << id
              << "]=function(vm)vm.noise=(vm.noise or 0)+1 end;";
     }
+    code << "local __lx_aux0={pc=1,code={" << mapping[5] << ','
+         << mapping[6] << "},handlers={}};"
+         << "__lx_aux0.handlers[" << mapping[5]
+         << "]=function(vm)vm.pc=vm.pc+1 end;"
+         << "__lx_aux0.handlers[" << mapping[6]
+         << "]=function(vm)vm.pc=vm.pc+1 end;"
+         << "while __lx_aux0.pc<=#__lx_aux0.code do "
+            "local h=__lx_aux0.handlers[__lx_aux0.code[__lx_aux0.pc]];"
+            "if not h then error(\"Luatrix auxiliary VM failure\") end;"
+            "h(__lx_aux0) end;"
+         << "local __lx_aux1={pc=1,code={" << mapping[7] << ','
+         << mapping[8] << "},handlers={}};"
+         << "__lx_aux1.handlers[" << mapping[7]
+         << "]=function(vm)vm.pc=vm.pc+1 end;"
+         << "__lx_aux1.handlers[" << mapping[8]
+         << "]=function(vm)vm.pc=vm.pc+1 end;"
+         << "while __lx_aux1.pc<=#__lx_aux1.code do "
+            "local h=__lx_aux1.handlers[__lx_aux1.code[__lx_aux1.pc]];"
+            "if not h then error(\"Luatrix auxiliary VM failure\") end;"
+            "h(__lx_aux1) end;";
 
     code << "__lx_handlers[" << mapping[0]
          << "]=function(vm)__lx_envcheck();local sum,roll=0,17;"
@@ -1133,23 +1165,27 @@ static std::string generate_bootstrap(const std::string& source,
             "vm.verified=true end;";
 
     code << "__lx_handlers[" << mapping[1]
-         << "]=function(vm)__lx_envcheck();local src={};local pos=1;"
-            "while pos<=#vm.blob do local b=__lx_byte(pos);"
-            "if b==255 then local count=__lx_byte(pos+1);"
-            "local value=__lx_byte(pos+2);"
-            "for j=1,count do src[#src+1]=value end;pos=pos+3;"
-            "else src[#src+1]=b;pos=pos+1 end end;"
-            "vm.src=src end;";
+         << "]=function(vm)__lx_envcheck();local src={};"
+            "if #vm.blob==0 then vm.src=src;return end;"
+            "local dict={};for i=0,255 do dict[i]=__lx_char(i) end;"
+            "local previous=dict[__lx_word(1)];"
+            "if not previous then error(\"Luatrix LZW header failure\") end;"
+            "src[1]=previous;local next_code=256;"
+            "for pos=2,#vm.blob do local code=__lx_word(pos);"
+            "local entry=dict[code];"
+            "if not entry then if code==next_code then "
+            "entry=previous..__lx_sub(previous,1,1) else "
+            "error(\"Luatrix LZW dictionary failure\") end end;"
+            "src[#src+1]=entry;"
+            "if next_code<=65535 then "
+            "dict[next_code]=previous..__lx_sub(entry,1,1);next_code=next_code+1 end;"
+            "previous=entry end;dict=nil;previous=nil;vm.src=src end;";
 
     code << "__lx_handlers[" << mapping[2]
-         << "]=function(vm)__lx_envcheck();local pieces={};local piece={};"
-            "for i=1,#vm.src do piece[#piece+1]=__lx_char(vm.src[i]);"
-            "if #piece==128 then pieces[#pieces+1]=__lx_concat(piece);"
-            "piece={} end end;if #piece>0 then pieces[#pieces+1]=__lx_concat(piece) end;"
-            "local text=__lx_concat(pieces);local loader=__lx_loader;"
-            "local fn,err=loader(text,\"LTRIX\");text=nil;pieces=nil;piece=nil;"
-            "for i=1,#vm.src do vm.src[i]=0 end;vm.src=nil;"
-            "if type(fn)~=\"function\" then error(\"Luatrix payload rejected: \"..tostring(err)) end;"
+         << "]=function(vm)__lx_envcheck();local src=vm.src;vm.src=nil;"
+            "local text=__lx_concat(src);for i=1,#src do src[i]=nil end;src=nil;"
+            "local loader=__lx_loader;local fn,err=loader(text,\"LTRIX\");text=nil;"
+            "if __lx_type(fn)~=\"function\" then error(\"Luatrix payload rejected: \"..tostring(err)) end;"
             "vm.fn=fn end;";
 
     code << "__lx_handlers[" << mapping[3]
