@@ -1089,7 +1089,7 @@ static std::string generate_bootstrap(const std::string& source,
                            static_cast<unsigned>(i)) % checksum_modulus;
         for (unsigned shift = 0; shift <= 8; shift += 8) {
             const unsigned byte = (compressed[i] >> shift) & 0xffU;
-            payload_tag = (payload_tag * 65599U + byte + payload_key +
+            payload_tag = (static_cast<std::uint64_t>(payload_tag) * 65599U + byte + payload_key +
                            static_cast<unsigned>(((i * 2U + shift / 8U + 1U) * 17U) %
                                                   checksum_modulus)) % checksum_modulus;
         }
@@ -1104,7 +1104,7 @@ static std::string generate_bootstrap(const std::string& source,
 
     unsigned model_attestation = 17;
     const auto fold_instruction = [&](unsigned value, OpCode op, int a, int b, int c) {
-        value = (value * 65599U + static_cast<unsigned>(op) +
+        value = (static_cast<std::uint64_t>(value) * 65599U + static_cast<unsigned>(op) +
                  static_cast<unsigned>(a) + static_cast<unsigned>(b) * 3U +
                  static_cast<unsigned>(c) * 5U) % checksum_modulus;
         return value;
@@ -1123,7 +1123,7 @@ static std::string generate_bootstrap(const std::string& source,
 
     unsigned code_attestation = 17;
     for (std::size_t i = 0; i < 5; ++i) {
-        code_attestation = (code_attestation * 65599U + mapping[i] +
+        code_attestation = (static_cast<std::uint64_t>(code_attestation) * 65599U + mapping[i] +
                             static_cast<unsigned>(i + 1) * 17U) % checksum_modulus;
     }
     code_attestation = (code_attestation * 65599U + model_attestation) % checksum_modulus;
