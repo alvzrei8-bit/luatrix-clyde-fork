@@ -1036,6 +1036,7 @@ static std::string generate_bootstrap(const std::string& source,
     const std::vector<unsigned> mapping = randomized_opcodes(32, rng);
     const std::vector<unsigned> compressed = lzw_compress(source);
     const unsigned payload_key = static_cast<unsigned>(rng() % 4093U) + 1U;
+    const unsigned opcode_mask = static_cast<unsigned>(rng() % 251U) + 1U;
     std::vector<unsigned> encrypted = compressed;
     for (std::size_t i = 0; i < encrypted.size(); ++i) {
         const unsigned mask = (payload_key +
@@ -1097,13 +1098,16 @@ static std::string generate_bootstrap(const std::string& source,
         code << mapping[i];
     }
     code << "};";
-    code << "local __lx_code={" << mapping[0] << ',' << mapping[1] << ','
-         << mapping[2] << ',' << mapping[3] << ',' << mapping[4] << "};";
+    code << "local __lx_code={" << (mapping[0] ^ opcode_mask) << ','
+         << (mapping[1] ^ opcode_mask) << ','
+         << (mapping[2] ^ opcode_mask) << ','
+         << (mapping[3] ^ opcode_mask) << ','
+         << (mapping[4] ^ opcode_mask) << "};";
     code << "local __lx_vm={pc=1,blob=__lx_blob,count=" << encrypted.size()
          << ",key=" << payload_key
          << ",seed=" << guard_seed << ",checksum=" << payload_checksum
          << ",rolling=" << payload_rolling << ",attestation="
-         << opcode_attestation << "};";
+         << opcode_attestation << ",mutation=" << opcode_mask << "};";
     code << "local __lx_xor=function(a,b)local r,p=0,1;while a>0 or b>0 do "
             "local x,y=a%2,b%2;if x~=y then r=r+p end;"
             "a=(a-x)/2;b=(b-y)/2;p=p*2 end;return r end;";
@@ -1141,7 +1145,7 @@ static std::string generate_bootstrap(const std::string& source,
             "for i=1,vm.count do local b=__lx_word(i);"
             "sum=(sum+b)%1000003;roll=(roll*257+b+i-1)%1000003 end;"
             "local att=vm.seed%1000003;"
-            "for i=1,#__lx_code do att=(att*33+__lx_code[i]+i)%1000003 end;"
+             "for i=1,5 do att=(att*33+__lx_ids[i]+i)%1000003 end;"
             "if sum~=vm.checksum or roll~=vm.rolling or att~=vm.attestation "
             "then error(\"x\") end;"
             "vm.verified=true end;";
@@ -1178,10 +1182,14 @@ static std::string generate_bootstrap(const std::string& source,
          << "]=function(vm)__lx_envcheck();if not vm.fn or not vm.wiped then "
             "error(\"x\") end;vm.halted=true end;";
 
-    code << "while not __lx_vm.halted do local op=__lx_code[__lx_vm.pc];"
+    code << "while not __lx_vm.halted do local op=__lx_xor("
+             "__lx_code[__lx_vm.pc],__lx_vm.mutation);"
             "local handler=__lx_handlers[op];if not handler then "
             "error(\"x\") end;"
             "handler(__lx_vm);__lx_vm.pc=__lx_vm.pc+1;"
+             "local delta=(__lx_vm.pc*17+__lx_vm.seed)%251+1;"
+             "for i=1,#__lx_code do __lx_code[i]=__lx_xor(__lx_code[i],delta) end;"
+             "__lx_vm.mutation=__lx_xor(__lx_vm.mutation,delta);"
             "if __lx_vm.pc>#__lx_code+1 then error(\"x\") end end;";
     code << "local __lx_fn=__lx_vm.fn;__lx_vm.fn=nil;__lx_vm.args=nil;"
          << "return __lx_fn(table.unpack(__lx_args))\n";
@@ -1205,6 +1213,7 @@ static std::string generate_bootstrap(const std::string& source,
         {"__lx_ids", "__lx_q"},
         {"__lx_code", "__lx_r"},
         {"__lx_vm", "__lx_s"},
+        {"__lx_mutation", "__lx_z"},
         {"__lx_xor", "__lx_t"},
         {"__lx_word", "__lx_u"},
         {"__lx_aux0", "__lx_w"},
