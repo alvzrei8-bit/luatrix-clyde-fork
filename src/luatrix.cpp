@@ -1057,12 +1057,12 @@ static std::string generate_bootstrap(const std::string& source,
     constexpr unsigned checksum_modulus = 1000003U;
     unsigned payload_checksum = 0;
     unsigned payload_rolling = 17;
-    for (std::size_t i = 0; i < encrypted.size(); ++i) {
+    for (std::size_t i = 0; i < compressed.size(); ++i) {
         payload_checksum =
-            (payload_checksum + static_cast<unsigned>(encrypted[i])) %
+            (payload_checksum + compressed[i]) %
             checksum_modulus;
         payload_rolling =
-            (payload_rolling * 257U + static_cast<unsigned>(encrypted[i]) +
+            (payload_rolling * 257U + compressed[i] +
              static_cast<unsigned>(i)) %
             checksum_modulus;
     }
