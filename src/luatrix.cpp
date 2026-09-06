@@ -972,7 +972,7 @@ static std::string scramble_control_flow(std::vector<Token> tokens, std::uint64_
         const std::size_t end = it->second;
         tokens.insert(tokens.begin() + static_cast<std::ptrdiff_t>(end),
                       {Token{Token::Kind::Punct, ") and (" + std::to_string(salt) +
-                                  "==" + std::to_string(salt) + ")", 0, {}}});
+                                  "==" + std::to_string(salt) + "))", 0, {}}});
         tokens.insert(tokens.begin() + static_cast<std::ptrdiff_t>(begin),
                       {Token{Token::Kind::Punct, "((", 0, {}}});
     }
