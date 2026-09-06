@@ -1010,24 +1010,15 @@ static std::vector<unsigned> lzw_compress(const std::string& source) {
     return encoded;
 }
 
-static const std::string& base85_alphabet() {
-    static const std::string alphabet =
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        "!#$%&()*+-;<=>?@^_`{|}~";
-    return alphabet;
-}
-
-static std::string base85_encode(const std::vector<unsigned>& data) {
-    const std::string& alphabet = base85_alphabet();
-    std::string output;
-    output.reserve(data.size() * 3);
-    for (unsigned value : data) {
-        for (int digit = 0; digit < 3; ++digit) {
-            output.push_back(alphabet[value % 85U]);
-            value /= 85U;
-        }
+static std::string lua_array(const std::vector<unsigned>& data) {
+    std::ostringstream output;
+    output << '{';
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (i != 0) output << ',';
+        output << data[i];
     }
-    return output;
+    output << '}';
+    return output.str();
 }
 
 static std::vector<unsigned> randomized_opcodes(std::size_t count, std::mt19937_64& rng) {
@@ -1052,8 +1043,6 @@ static std::string generate_bootstrap(const std::string& source,
                               4096U;
         encrypted[i] = encrypted[i] ^ mask;
     }
-    const std::string encoded_payload = base85_encode(encrypted);
-
     constexpr unsigned checksum_modulus = 1000003U;
     unsigned payload_checksum = 0;
     unsigned payload_rolling = 17;
@@ -1084,10 +1073,9 @@ static std::string generate_bootstrap(const std::string& source,
          << "local __lx_string=string;local __lx_table=table;"
          << "local __lx_char=__lx_string and __lx_string.char;"
          << "local __lx_sub=__lx_string and __lx_string.sub;"
-         << "local __lx_b85=" << '"' << base85_alphabet() << '"' << ";"
          << "local __lx_concat=__lx_table and __lx_table.concat;"
          << "local __lx_loader=loadstring or load;";
-    code << "local __lx_blob=\"" << encoded_payload << "\";";
+    code << "local __lx_blob=" << lua_array(encrypted) << ";";
     code << "local __lx_envcheck=function()"
             "if __lx_type~=type or __lx_pcall~=pcall "
             "or __lx_type(__lx_loader)~=\"function\" or __lx_type(__lx_char)~=\"function\" "
@@ -1109,9 +1097,7 @@ static std::string generate_bootstrap(const std::string& source,
         code << mapping[i];
     }
     code << "};";
-    code << "local __lx_b85_index={};for i=1,#__lx_b85 do "
-            "__lx_b85_index[__lx_sub(__lx_b85,i,i)]=i-1 end;"
-         << "local __lx_code={" << mapping[0] << ',' << mapping[1] << ','
+    code << "local __lx_code={" << mapping[0] << ',' << mapping[1] << ','
          << mapping[2] << ',' << mapping[3] << ',' << mapping[4] << "};";
     code << "local __lx_vm={pc=1,blob=__lx_blob,count=" << encrypted.size()
          << ",key=" << payload_key
@@ -1121,13 +1107,9 @@ static std::string generate_bootstrap(const std::string& source,
     code << "local __lx_xor=function(a,b)local r,p=0,1;while a>0 or b>0 do "
             "local x,y=a%2,b%2;if x~=y then r=r+p end;"
             "a=(a-x)/2;b=(b-y)/2;p=p*2 end;return r end;";
-    code << "local __lx_word=function(pos)local offset=(pos-1)*3+1;"
-            "local a=__lx_b85_index[__lx_sub(__lx_vm.blob,offset,offset)];"
-            "local b=__lx_b85_index[__lx_sub(__lx_vm.blob,offset+1,offset+1)];"
-            "local c=__lx_b85_index[__lx_sub(__lx_vm.blob,offset+2,offset+2)];"
-            "if not a or not b or not c then error(\"x\") end;"
-            "local value=a+b*85+c*7225;local mask=("
-         << "__lx_vm.key+((pos-1)*31)%4093)%4096;return __lx_xor(value,mask)end;";
+    code << "local __lx_word=function(pos)local mask=("
+         << "__lx_vm.key+((pos-1)*31)%4093)%4096;return __lx_xor("
+         << "__lx_vm.blob[pos],mask)end;";
     code << "local __lx_handlers={};";
     for (unsigned id : mapping) {
         code << "__lx_handlers[" << id
@@ -1205,7 +1187,6 @@ static std::string generate_bootstrap(const std::string& source,
          << "return __lx_fn(table.unpack(__lx_args))\n";
     std::string generated = code.str();
     const std::vector<std::pair<std::string, std::string>> generated_names = {
-        {"__lx_b85_index", "__lx_i"},
         {"__lx_handlers", "__lx_v"},
         {"__lx_suspicious", "__lx_n"},
         {"__lx_envcheck", "__lx_p"},
@@ -1221,7 +1202,6 @@ static std::string generate_bootstrap(const std::string& source,
         {"__lx_char", "__lx_g"},
         {"__lx_sub", "__lx_h"},
         {"__lx_blob", "__lx_o"},
-        {"__lx_b85", "__lx_j"},
         {"__lx_ids", "__lx_q"},
         {"__lx_code", "__lx_r"},
         {"__lx_vm", "__lx_s"},
