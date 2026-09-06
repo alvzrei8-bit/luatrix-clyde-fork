@@ -1022,51 +1022,117 @@ static std::string generate_bootstrap(const std::string& source,
                                       const StackChunk& stack,
                                       const RegisterChunk& registers,
                                       std::mt19937_64& rng) {
-    const unsigned string_key = static_cast<unsigned>(rng() % 251U) + 1U;
     const unsigned guard_seed = static_cast<unsigned>(rng() % 97U) + 3U;
     const std::vector<unsigned> mapping = randomized_opcodes(32, rng);
     std::vector<unsigned char> compressed = rle_compress(source);
+    const unsigned payload_key = static_cast<unsigned>(rng() % 251U) + 1U;
+    std::vector<unsigned char> encrypted = compressed;
+    for (std::size_t i = 0; i < encrypted.size(); ++i) {
+        const unsigned mask = (payload_key +
+                               static_cast<unsigned>((i * 31U) % 251U)) & 0xffU;
+        encrypted[i] = static_cast<unsigned char>(
+            static_cast<unsigned>(encrypted[i]) ^ mask);
+    }
+
+    constexpr unsigned checksum_modulus = 1000003U;
+    unsigned payload_checksum = 0;
+    unsigned payload_rolling = 17;
+    for (std::size_t i = 0; i < encrypted.size(); ++i) {
+        payload_checksum =
+            (payload_checksum + static_cast<unsigned>(encrypted[i])) %
+            checksum_modulus;
+        payload_rolling =
+            (payload_rolling * 257U + static_cast<unsigned>(encrypted[i]) +
+             static_cast<unsigned>(i)) %
+            checksum_modulus;
+    }
+
+    unsigned opcode_attestation = guard_seed % checksum_modulus;
+    for (std::size_t i = 0; i < 5; ++i) {
+        opcode_attestation =
+            (opcode_attestation * 33U + mapping[i] +
+             static_cast<unsigned>(i + 1)) %
+            checksum_modulus;
+    }
+
+    (void)stack;
+    (void)registers;
 
     std::ostringstream code;
     code << "--[Luatrix | LTRIX]\n";
-    code << "local __lx_blob=" << lua_array(compressed) << ";local __lx_src={};\n";
-    code << "local __lx_i=1;while __lx_i<=#__lx_blob do local __lx_b=__lx_blob[__lx_i];"
-            "if __lx_b==255 then local __lx_n=__lx_blob[__lx_i+1];"
-            "local __lx_v=__lx_blob[__lx_i+2];for __lx_j=1,__lx_n do "
-            "__lx_src[#__lx_src+1]=__lx_v end;__lx_i=__lx_i+3 else "
-            "__lx_src[#__lx_src+1]=__lx_b;__lx_i=__lx_i+1 end end;\n";
-    code << "local __lx_text=string.char(table.unpack(__lx_src));"
-         << "local __lx_key=" << string_key << ";";
+    code << "local __lx_args={...};";
+    code << "local __lx_blob=" << lua_array(encrypted) << ";";
     code << "local __lx_ids={";
     for (std::size_t i = 0; i < mapping.size(); ++i) {
         if (i != 0) code << ',';
         code << mapping[i];
     }
     code << "};";
-    code << "local __lx_code={";
-    for (std::size_t i = 0; i < stack.code.size(); ++i) {
-        if (i != 0) code << ',';
-        const unsigned original = static_cast<unsigned>(static_cast<int>(stack.code[i].op));
-        code << mapping[original % mapping.size()];
-    }
-    code << "};";
-    code << "local __lx_regs=" << registers.code.size() << ";";
+    code << "local __lx_code={" << mapping[0] << ',' << mapping[1] << ','
+         << mapping[2] << ',' << mapping[3] << ',' << mapping[4] << "};";
+    code << "local __lx_vm={pc=1,blob=__lx_blob,key=" << payload_key
+         << ",seed=" << guard_seed << ",checksum=" << payload_checksum
+         << ",rolling=" << payload_rolling << ",attestation="
+         << opcode_attestation << "};";
+    code << "local __lx_xor=function(a,b)local r,p=0,1;while a>0 or b>0 do "
+            "local x,y=a%2,b%2;if x~=y then r=r+p end;"
+            "a=(a-x)/2;b=(b-y)/2;p=p*2 end;return r end;";
+    code << "local __lx_byte=function(pos)local mask=("
+         << "__lx_vm.key+((pos-1)*31)%251)%256;return __lx_xor("
+         << "__lx_vm.blob[pos],mask)end;";
     code << "local __lx_handlers={};";
     for (unsigned id : mapping) {
-        code << "__lx_handlers[" << id << "]=function()end;";
+        code << "__lx_handlers[" << id
+             << "]=function(vm)vm.noise=(vm.noise or 0)+1 end;";
     }
-    code << "local __lx_pc=1;while __lx_pc<=#__lx_code do local __lx_h="
-            "__lx_handlers[__lx_code[__lx_pc]];if not __lx_h then error("
-            "\"Luatrix opcode integrity failure\")end;__lx_h();__lx_pc=__lx_pc+1 end;\n";
-    code << "local __lx_guard=" << guard_seed << "*" << guard_seed << "-"
-         << guard_seed * guard_seed << ";";
-    code << "if __lx_guard~=0 or type(loadstring or load)~=\"function\" then "
-            "error(\"Luatrix integrity check failed\") end;";
-    code << "if rawget(_G,\"debug\") and type(rawget(_G,\"debug\").gethook)=="
-            "\"function\" and rawget(_G,\"debug\").gethook() then "
-            "error(\"Luatrix debugger detected\") end;";
-    code << "local __lx_load=loadstring or load;return __lx_load(__lx_text,\"LTRIX\")(...)\n";
-    (void)string_key;
+
+    code << "__lx_handlers[" << mapping[0]
+         << "]=function(vm)local sum,roll=0,17;"
+            "for i=1,#vm.blob do local b=vm.blob[i];"
+            "sum=(sum+b)%1000003;roll=(roll*257+b+i-1)%1000003 end;"
+            "local att=vm.seed%1000003;"
+            "for i=1,#__lx_code do att=(att*33+__lx_code[i]+i)%1000003 end;"
+            "if sum~=vm.checksum or roll~=vm.rolling or "
+            "att~=vm.attestation or type(loadstring or load)~=\"function\" "
+            "or type(string.char)~=\"function\" or type(table.concat)~=\"function\" "
+            "then error(\"Luatrix VM integrity failure\") end;"
+            "vm.verified=true end;";
+
+    code << "__lx_handlers[" << mapping[1]
+         << "]=function(vm)local src={};local pos=1;"
+            "while pos<=#vm.blob do local b=__lx_byte(pos);"
+            "if b==255 then local count=__lx_byte(pos+1);"
+            "local value=__lx_byte(pos+2);"
+            "for j=1,count do src[#src+1]=value end;pos=pos+3;"
+            "else src[#src+1]=b;pos=pos+1 end end;"
+            "vm.src=src end;";
+
+    code << "__lx_handlers[" << mapping[2]
+         << "]=function(vm)local pieces={};local piece={};"
+            "for i=1,#vm.src do piece[#piece+1]=string.char(vm.src[i]);"
+            "if #piece==128 then pieces[#pieces+1]=table.concat(piece);"
+            "piece={} end end;if #piece>0 then pieces[#pieces+1]=table.concat(piece) end;"
+            "local text=table.concat(pieces);local loader=loadstring or load;"
+            "local fn,err=loader(text,\"LTRIX\");text=nil;pieces=nil;piece=nil;"
+            "for i=1,#vm.src do vm.src[i]=0 end;vm.src=nil;"
+            "if type(fn)~=\"function\" then error(\"Luatrix payload rejected: \"..tostring(err)) end;"
+            "vm.fn=fn end;";
+
+    code << "__lx_handlers[" << mapping[3]
+         << "]=function(vm)if vm.blob then for i=1,#vm.blob do vm.blob[i]=0 end end;"
+            "vm.blob=nil;vm.key=0;vm.checksum=0;vm.rolling=0;vm.wiped=true end;";
+
+    code << "__lx_handlers[" << mapping[4]
+         << "]=function(vm)if not vm.fn or not vm.wiped then "
+            "error(\"Luatrix VM lifecycle failure\") end;vm.halted=true end;";
+
+    code << "while not __lx_vm.halted do local op=__lx_code[__lx_vm.pc];"
+            "local handler=__lx_handlers[op];if not handler then "
+            "error(\"Luatrix VM opcode integrity failure\") end;"
+            "handler(__lx_vm);__lx_vm.pc=__lx_vm.pc+1;"
+            "if __lx_vm.pc>#__lx_code+1 then error(\"Luatrix VM runaway\") end end;";
+    code << "local __lx_fn=__lx_vm.fn;__lx_vm.fn=nil;__lx_vm.args=nil;"
+         << "return __lx_fn(table.unpack(__lx_args))\n";
     return code.str();
 }
 
