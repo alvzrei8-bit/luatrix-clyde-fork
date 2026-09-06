@@ -1028,45 +1028,112 @@ static std::vector<unsigned> randomized_opcodes(std::size_t count, std::mt19937_
     return values;
 }
 
+static std::vector<unsigned> make_sbox(std::mt19937_64& rng) {
+    std::vector<unsigned> sbox(256);
+    for (unsigned i = 0; i < 256; ++i) sbox[i] = i;
+    std::shuffle(sbox.begin(), sbox.end(), rng);
+    return sbox;
+}
+
+static std::vector<unsigned> invert_sbox(const std::vector<unsigned>& sbox) {
+    std::vector<unsigned> inverse(256);
+    for (unsigned i = 0; i < 256; ++i) inverse[sbox[i]] = i;
+    return inverse;
+}
+
+static std::vector<unsigned> encrypt_payload(const std::vector<unsigned>& words,
+                                              unsigned key,
+                                              unsigned nonce,
+                                              const std::vector<unsigned>& sbox) {
+    std::vector<unsigned> encrypted;
+    encrypted.reserve(words.size() * 2);
+    unsigned previous = nonce % 256U;
+    std::size_t index = 0;
+    for (unsigned word : words) {
+        for (unsigned shift = 0; shift <= 8; shift += 8) {
+            const unsigned plain = (word >> shift) & 0xffU;
+            const unsigned mix = (key +
+                                  static_cast<unsigned>(((index + 1) * 29U) % 256U) +
+                                  (previous * 131U) % 256U + nonce) % 256U;
+            const unsigned cipher = (sbox[plain] + mix) % 256U;
+            encrypted.push_back(cipher);
+            previous = cipher;
+            ++index;
+        }
+    }
+    return encrypted;
+}
+
 static std::string generate_bootstrap(const std::string& source,
                                       const StackChunk& stack,
                                       const RegisterChunk& registers,
                                       std::mt19937_64& rng) {
+    constexpr unsigned checksum_modulus = 1000003U;
     const unsigned guard_seed = static_cast<unsigned>(rng() % 97U) + 3U;
     const std::vector<unsigned> mapping = randomized_opcodes(32, rng);
     const std::vector<unsigned> compressed = lzw_compress(source);
-    const unsigned payload_key = static_cast<unsigned>(rng() % 4093U) + 1U;
+    const unsigned payload_key = static_cast<unsigned>(rng() % 65521U) + 1U;
+    const unsigned payload_nonce = static_cast<unsigned>(rng() % 65521U) + 1U;
     const unsigned opcode_mask = static_cast<unsigned>(rng() % 251U) + 1U;
-    std::vector<unsigned> encrypted = compressed;
-    for (std::size_t i = 0; i < encrypted.size(); ++i) {
-        const unsigned mask = (payload_key +
-                               static_cast<unsigned>((i * 31U) % 4093U)) %
-                              4096U;
-        encrypted[i] = encrypted[i] ^ mask;
-    }
-    constexpr unsigned checksum_modulus = 1000003U;
+    const std::vector<unsigned> sbox = make_sbox(rng);
+    const std::vector<unsigned> inverse_sbox = invert_sbox(sbox);
+    const std::vector<unsigned> encrypted =
+        encrypt_payload(compressed, payload_key, payload_nonce, sbox);
+
     unsigned payload_checksum = 0;
     unsigned payload_rolling = 17;
+    unsigned payload_tag = 216613U;
     for (std::size_t i = 0; i < compressed.size(); ++i) {
-        payload_checksum =
-            (payload_checksum + compressed[i]) %
-            checksum_modulus;
-        payload_rolling =
-            (payload_rolling * 257U + compressed[i] +
-             static_cast<unsigned>(i)) %
-            checksum_modulus;
+        payload_checksum = (payload_checksum + compressed[i]) % checksum_modulus;
+        payload_rolling = (payload_rolling * 257U + compressed[i] +
+                           static_cast<unsigned>(i)) % checksum_modulus;
+        for (unsigned shift = 0; shift <= 8; shift += 8) {
+            const unsigned byte = (compressed[i] >> shift) & 0xffU;
+            payload_tag = (payload_tag * 65599U + byte + payload_key +
+                           static_cast<unsigned>(((i * 2U + shift / 8U + 1U) * 17U) %
+                                                  checksum_modulus)) % checksum_modulus;
+        }
     }
 
     unsigned opcode_attestation = guard_seed % checksum_modulus;
     for (std::size_t i = 0; i < 5; ++i) {
         opcode_attestation =
             (opcode_attestation * 33U + mapping[i] +
-             static_cast<unsigned>(i + 1)) %
-            checksum_modulus;
+             static_cast<unsigned>(i + 1)) % checksum_modulus;
     }
 
-    (void)stack;
-    (void)registers;
+    unsigned model_attestation = 17;
+    const auto fold_instruction = [&](unsigned value, OpCode op, int a, int b, int c) {
+        value = (value * 65599U + static_cast<unsigned>(op) +
+                 static_cast<unsigned>(a) + static_cast<unsigned>(b) * 3U +
+                 static_cast<unsigned>(c) * 5U) % checksum_modulus;
+        return value;
+    };
+    for (const Instruction& instruction : stack.code) {
+        model_attestation = fold_instruction(model_attestation, instruction.op,
+                                             instruction.a, instruction.b, instruction.c);
+    }
+    for (const RegisterInstruction& instruction : registers.code) {
+        model_attestation = fold_instruction(model_attestation, instruction.op,
+                                             instruction.a, instruction.b, instruction.c);
+    }
+    model_attestation = (model_attestation * 65599U + stack.constants.size() * 7U +
+                         registers.constants.size() * 11U + registers.max_registers) %
+                        checksum_modulus;
+
+    unsigned code_attestation = 17;
+    for (std::size_t i = 0; i < 5; ++i) {
+        code_attestation = (code_attestation * 65599U + mapping[i] +
+                            static_cast<unsigned>(i + 1) * 17U) % checksum_modulus;
+    }
+    code_attestation = (code_attestation * 65599U + model_attestation) % checksum_modulus;
+
+    std::array<unsigned, 6> chain{};
+    chain[0] = (payload_tag * 97U + opcode_attestation + guard_seed) % checksum_modulus;
+    for (std::size_t i = 0; i < 5; ++i) {
+        chain[i + 1] = (chain[i] * 97U + mapping[i] +
+                        static_cast<unsigned>(i + 1) * 13U) % checksum_modulus;
+    }
 
     std::ostringstream code;
     code << "local __lx_args={...};"
@@ -1075,13 +1142,15 @@ static std::string generate_bootstrap(const std::string& source,
          << "local __lx_char=__lx_string and __lx_string.char;"
          << "local __lx_sub=__lx_string and __lx_string.sub;"
          << "local __lx_concat=__lx_table and __lx_table.concat;"
-         << "local __lx_loader=loadstring or load;";
-    code << "local __lx_blob=" << lua_array(encrypted) << ";";
+         << "local __lx_loader=loadstring or load;local __lx_debug=debug;";
+    code << "local __lx_blob=" << lua_array(encrypted) << ";"
+         << "local __lx_sbox=" << lua_array(sbox) << ";"
+         << "local __lx_inv=" << lua_array(inverse_sbox) << ";";
     code << "local __lx_envcheck=function()"
             "if __lx_type~=type or __lx_pcall~=pcall "
             "or __lx_type(__lx_loader)~=\"function\" or __lx_type(__lx_char)~=\"function\" "
             "or __lx_type(__lx_sub)~=\"function\" or __lx_type(__lx_concat)~=\"function\" then "
-             "error(\"x\") end;"
+            "error(\"x\") end;"
             "if __lx_string~=string or __lx_table~=table or "
             "__lx_string.char~=__lx_char or __lx_string.sub~=__lx_sub "
             "or __lx_table.concat~=__lx_concat "
@@ -1089,136 +1158,146 @@ static std::string generate_bootstrap(const std::string& source,
             "error(\"x\") end;"
             "local probe_ok,probe_value=__lx_pcall(function() "
             "return __lx_char(97,98,99,100,101)==__lx_concat({\"a\",\"b\",\"c\",\"d\",\"e\"}) "
-            "end);if not probe_ok or not probe_value then "
-            "error(\"x\") end;"
-            "return true end;";
+            "end);if not probe_ok or not probe_value then error(\"x\") end;"
+            "if __lx_debug and __lx_type(__lx_debug)==\"table\" "
+            "and __lx_type(__lx_debug.gethook)==\"function\" then "
+            "local hook_ok,hook_fn,hook_mask,hook_count=__lx_pcall(__lx_debug.gethook);"
+            "if hook_ok and (hook_fn~=nil or hook_mask~=nil or hook_count~=nil) then "
+            "error(\"x\") end end;return true end;";
     code << "local __lx_ids={";
     for (std::size_t i = 0; i < mapping.size(); ++i) {
         if (i != 0) code << ',';
         code << mapping[i];
     }
     code << "};";
-    code << "local __lx_code={" << (mapping[0] ^ opcode_mask) << ','
-         << (mapping[1] ^ opcode_mask) << ','
-         << (mapping[2] ^ opcode_mask) << ','
-         << (mapping[3] ^ opcode_mask) << ','
-         << (mapping[4] ^ opcode_mask) << "};";
-    code << "local __lx_vm={pc=1,blob=__lx_blob,count=" << encrypted.size()
-         << ",key=" << payload_key
-         << ",seed=" << guard_seed << ",checksum=" << payload_checksum
-         << ",rolling=" << payload_rolling << ",attestation="
-         << opcode_attestation << ",mutation=" << opcode_mask << "};";
+    code << "local __lx_chain={";
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        if (i != 0) code << ',';
+        code << chain[i];
+    }
+    code << "};";
+    code << "local __lx_code={{" << (mapping[0] ^ opcode_mask) << ",1},{"
+         << (mapping[1] ^ opcode_mask) << ",2},{"
+         << (mapping[2] ^ opcode_mask) << ",3},{"
+         << (mapping[3] ^ opcode_mask) << ",4},{"
+         << (mapping[4] ^ opcode_mask) << ",5}};";
+    code << "local __lx_vm={pc=1,blob=__lx_blob,count=" << compressed.size()
+         << ",bytes=" << encrypted.size() << ",key=" << payload_key
+         << ",nonce=" << payload_nonce << ",seed=" << guard_seed
+         << ",checksum=" << payload_checksum << ",rolling=" << payload_rolling
+         << ",tag=" << payload_tag << ",attestation=" << opcode_attestation
+         << ",codeTag=" << code_attestation << ",model=" << model_attestation
+         << ",mutation=" << opcode_mask << ",stage=0,chain=" << chain[0] << "};";
     code << "local __lx_xor=function(a,b)local r,p=0,1;while a>0 or b>0 do "
             "local x,y=a%2,b%2;if x~=y then r=r+p end;"
             "a=(a-x)/2;b=(b-y)/2;p=p*2 end;return r end;";
-    code << "local __lx_word=function(pos)local mask=("
-         << "__lx_vm.key+((pos-1)*31)%4093)%4096;return __lx_xor("
-         << "__lx_vm.blob[pos],mask)end;";
+    code << "local __lx_decode=function(vm)local bytes={};local previous=vm.nonce%256;"
+            "for i=1,#vm.blob do local c=vm.blob[i];"
+            "local mix=(vm.key+((i*29)%256)+((previous*131)%256)+vm.nonce)%256;"
+            "bytes[i]=__lx_inv[((c+256-mix)%256)+1];previous=c end;"
+            "local words={};for i=1,#bytes,2 do words[#words+1]=bytes[i]+bytes[i+1]*256 end;"
+            "return bytes,words end;";
     code << "local __lx_handlers={};";
     for (unsigned id : mapping) {
         code << "__lx_handlers[" << id
-             << "]=function(vm)vm.noise=(vm.noise or 0)+1 end;";
+             << "]=function(vm,arg)vm.noise=(vm.noise or 0)+1 end;";
     }
-    code << "local __lx_aux0={pc=1,code={" << mapping[5] << ','
-         << mapping[6] << "},source=\"print(\\\"skid\\\")\",h={}};"
-         << "__lx_aux0.h[" << mapping[5]
-         << "]=function(vm)vm.pc=vm.pc+1 end;"
-         << "__lx_aux0.h[" << mapping[6]
-         << "]=function(vm)vm.pc=vm.pc+1 end;"
-         << "while __lx_aux0.pc<=#__lx_aux0.code do "
-            "local h=__lx_aux0.h[__lx_aux0.code[__lx_aux0.pc]];"
-            "if not h then error(\"x\") end;"
-            "h(__lx_aux0) end;"
-         << "local __lx_aux1={pc=1,code={" << mapping[7] << ','
-         << mapping[8] << "},source=\"print(\\\"skid\\\")\",h={}};"
-         << "__lx_aux1.h[" << mapping[7]
-         << "]=function(vm)vm.pc=vm.pc+1 end;"
-         << "__lx_aux1.h[" << mapping[8]
-         << "]=function(vm)vm.pc=vm.pc+1 end;"
-         << "while __lx_aux1.pc<=#__lx_aux1.code do "
-            "local h=__lx_aux1.h[__lx_aux1.code[__lx_aux1.pc]];"
-            "if not h then error(\"x\") end;"
-            "h(__lx_aux1) end;";
 
-    code << "__lx_handlers[" << mapping[0]
-         << "]=function(vm)__lx_envcheck();local sum,roll=0,17;"
-            "for i=1,vm.count do local b=__lx_word(i);"
-            "sum=(sum+b)%1000003;roll=(roll*257+b+i-1)%1000003 end;"
+    const auto guard_for = [&](unsigned stage) {
+        std::ostringstream guard;
+        guard << "if vm.stage~=" << stage << " or vm.chain~=__lx_chain["
+              << (stage + 1) << "] or arg~=" << (stage + 1)
+              << " then error(\"x\") end;"
+              << "local ca=17;for i=1,#__lx_code do local cell=__lx_code[i];"
+              << "if __lx_type(cell)~=\"table\" or __lx_type(cell[1])~=\"number\" "
+                 "or cell[2]~=i then error(\"x\") end;"
+              << "local decoded=__lx_xor(cell[1],vm.mutation);"
+              << "ca=(ca*65599+decoded+cell[2]*17+i)%1000003 end;"
+              << "ca=(ca*65599+vm.model)%1000003;"
+              << "if ca~=vm.codeTag then error(\"x\") end;";
+        return guard.str();
+    };
+
+    code << "__lx_handlers[" << mapping[0] << "]=function(vm,arg)"
+         << "__lx_envcheck();" << guard_for(0)
+         << "local bytes,words=__lx_decode(vm);local sum,roll=0,17;"
+            "local tag=216613;for i=1,#words do local b=words[i];"
+            "sum=(sum+b)%1000003;roll=(roll*257+b+i-1)%1000003;"
+            "for shift=0,8,8 do local byte=math.floor(b/(2^shift))%256;"
+            "tag=(tag*65599+byte+vm.key+(( (i-1)*2+shift/8+1)*17)%1000003)%1000003 end end;"
             "local att=vm.seed%1000003;"
-             "for i=1,5 do att=(att*33+__lx_ids[i]+i)%1000003 end;"
-            "if sum~=vm.checksum or roll~=vm.rolling or att~=vm.attestation "
-            "then error(\"x\") end;"
-            "vm.verified=true end;";
+            "for i=1,5 do att=(att*33+__lx_ids[i]+i)%1000003 end;"
+            "if sum~=vm.checksum or roll~=vm.rolling or tag~=vm.tag or "
+            "att~=vm.attestation or #bytes~=vm.bytes then error(\"x\") end;"
+            "vm.bytes=bytes;vm.words=words;vm.verified=true;vm.stage=1;"
+            "vm.chain=__lx_chain[2] end;";
 
-    code << "__lx_handlers[" << mapping[1]
-         << "]=function(vm)__lx_envcheck();local src={};"
-            "if vm.count==0 then vm.src=src;return end;"
+    code << "__lx_handlers[" << mapping[1] << "]=function(vm,arg)"
+         << "__lx_envcheck();" << guard_for(1)
+         << "if not vm.verified or not vm.words then error(\"x\") end;"
+            "local words=vm.words;local src={};"
+            "if vm.count==0 then vm.src=src;vm.stage=2;vm.chain=__lx_chain[3];return end;"
             "local dict={};for i=0,255 do dict[i]=__lx_char(i) end;"
-            "local previous=dict[__lx_word(1)];"
-            "if not previous then error(\"x\") end;"
+            "local previous=dict[words[1]];if not previous then error(\"x\") end;"
             "src[1]=previous;local next_code=256;"
-            "for pos=2,vm.count do local code=__lx_word(pos);"
-            "local entry=dict[code];"
-            "if not entry then if code==next_code then "
-            "entry=previous..__lx_sub(previous,1,1) else "
-            "error(\"x\") end end;"
-            "src[#src+1]=entry;"
-            "if next_code<=65535 then "
-            "dict[next_code]=previous..__lx_sub(entry,1,1);next_code=next_code+1 end;"
-            "previous=entry end;dict=nil;previous=nil;vm.src=src end;";
+            "for pos=2,vm.count do local word=words[pos];local entry=dict[word];"
+            "if not entry then if word==next_code then entry=previous..__lx_sub(previous,1,1) "
+            "else error(\"x\") end end;src[#src+1]=entry;"
+            "if next_code<=65535 then dict[next_code]=previous..__lx_sub(entry,1,1);"
+            "next_code=next_code+1 end;previous=entry end;"
+            "dict=nil;previous=nil;vm.words=nil;vm.src=src;vm.stage=2;"
+            "vm.chain=__lx_chain[3] end;";
 
-    code << "__lx_handlers[" << mapping[2]
-         << "]=function(vm)__lx_envcheck();local src=vm.src;vm.src=nil;"
-            "local text=__lx_concat(src);for i=1,#src do src[i]=nil end;src=nil;"
+    code << "__lx_handlers[" << mapping[2] << "]=function(vm,arg)"
+         << "__lx_envcheck();" << guard_for(2)
+         << "if not vm.src or not vm.verified then error(\"x\") end;"
+            "local src=vm.src;vm.src=nil;local text=__lx_concat(src);"
+            "for i=1,#src do src[i]=nil end;src=nil;"
             "local loader=__lx_loader;local fn,err=loader(text,\"x\");text=nil;"
             "if __lx_type(fn)~=\"function\" then error(\"x\") end;"
-            "vm.fn=fn end;";
+            "vm.fn=fn;vm.stage=3;vm.chain=__lx_chain[4] end;";
 
-    code << "__lx_handlers[" << mapping[3]
-         << "]=function(vm)__lx_envcheck();vm.blob=\"\";vm.count=0;"
-            "vm.key=0;vm.checksum=0;vm.rolling=0;vm.wiped=true end;";
+    code << "__lx_handlers[" << mapping[3] << "]=function(vm,arg)"
+         << "__lx_envcheck();" << guard_for(3)
+         << "if not vm.fn or not vm.verified then error(\"x\") end;"
+            "vm.blob={};vm.bytes=nil;vm.words=nil;vm.key=0;vm.nonce=0;"
+            "vm.checksum=0;vm.rolling=0;vm.tag=0;vm.wiped=true;"
+            "vm.stage=4;vm.chain=__lx_chain[5] end;";
 
-    code << "__lx_handlers[" << mapping[4]
-         << "]=function(vm)__lx_envcheck();if not vm.fn or not vm.wiped then "
-            "error(\"x\") end;vm.halted=true end;";
+    code << "__lx_handlers[" << mapping[4] << "]=function(vm,arg)"
+         << "__lx_envcheck();" << guard_for(4)
+         << "if not vm.fn or not vm.wiped then error(\"x\") end;"
+            "vm.halted=true;vm.chain=__lx_chain[6] end;";
 
-    code << "while not __lx_vm.halted do local op=__lx_xor("
-             "__lx_code[__lx_vm.pc],__lx_vm.mutation);"
-            "local handler=__lx_handlers[op];if not handler then "
-            "error(\"x\") end;"
-            "handler(__lx_vm);__lx_vm.pc=__lx_vm.pc+1;"
-             "local delta=(__lx_vm.pc*17+__lx_vm.seed)%251+1;"
-             "for i=1,#__lx_code do __lx_code[i]=__lx_xor(__lx_code[i],delta) end;"
-             "__lx_vm.mutation=__lx_xor(__lx_vm.mutation,delta);"
+    code << "while not __lx_vm.halted do local cell=__lx_code[__lx_vm.pc];"
+            "if __lx_type(cell)~=\"table\" then error(\"x\") end;"
+            "local op=__lx_xor(cell[1],__lx_vm.mutation);"
+            "local handler=__lx_handlers[op];if not handler then error(\"x\") end;"
+            "handler(__lx_vm,cell[2]);__lx_vm.pc=__lx_vm.pc+1;"
+            "local delta=(__lx_vm.pc*17+__lx_vm.seed)%251+1;"
+            "for i=1,#__lx_code do __lx_code[i][1]=__lx_xor(__lx_code[i][1],delta) end;"
+            "__lx_vm.mutation=__lx_xor(__lx_vm.mutation,delta);"
             "if __lx_vm.pc>#__lx_code+1 then error(\"x\") end end;";
     code << "local __lx_fn=__lx_vm.fn;__lx_vm.fn=nil;__lx_vm.args=nil;"
          << "return __lx_fn(table.unpack(__lx_args))\n";
+
     std::string generated = code.str();
     const std::vector<std::pair<std::string, std::string>> generated_names = {
-        {"__lx_handlers", "__lx_v"},
-        {"__lx_suspicious", "__lx_n"},
-        {"__lx_envcheck", "__lx_p"},
-        {"__lx_loader", "__lx_l"},
-        {"__lx_global", "__lx_m"},
-        {"__lx_concat", "__lx_k"},
-        {"__lx_string", "__lx_e"},
-        {"__lx_table", "__lx_f"},
-        {"__lx_args", "__lx_a"},
-        {"__lx_type", "__lx_b"},
-        {"__lx_pcall", "__lx_c"},
-        {"__lx_rawget", "__lx_d"},
-        {"__lx_char", "__lx_g"},
-        {"__lx_sub", "__lx_h"},
-        {"__lx_blob", "__lx_o"},
-        {"__lx_ids", "__lx_q"},
-        {"__lx_code", "__lx_r"},
-        {"__lx_vm", "__lx_s"},
-        {"__lx_mutation", "__lx_z"},
-        {"__lx_xor", "__lx_t"},
-        {"__lx_word", "__lx_u"},
-        {"__lx_aux0", "__lx_w"},
-        {"__lx_aux1", "__lx_x"},
-        {"__lx_fn", "__lx_y"}
+        {"__lx_handlers", "__lx_v"}, {"__lx_suspicious", "__lx_n"},
+        {"__lx_envcheck", "__lx_p"}, {"__lx_loader", "__lx_l"},
+        {"__lx_global", "__lx_m"}, {"__lx_concat", "__lx_k"},
+        {"__lx_string", "__lx_e"}, {"__lx_table", "__lx_f"},
+        {"__lx_args", "__lx_a"}, {"__lx_type", "__lx_b"},
+        {"__lx_pcall", "__lx_c"}, {"__lx_rawget", "__lx_d"},
+        {"__lx_char", "__lx_g"}, {"__lx_sub", "__lx_h"},
+        {"__lx_blob", "__lx_o"}, {"__lx_ids", "__lx_q"},
+        {"__lx_code", "__lx_r"}, {"__lx_vm", "__lx_s"},
+        {"__lx_mutation", "__lx_z"}, {"__lx_xor", "__lx_t"},
+        {"__lx_word", "__lx_u"}, {"__lx_aux0", "__lx_w"},
+        {"__lx_aux1", "__lx_x"}, {"__lx_fn", "__lx_y"},
+        {"__lx_sbox", "__lx_i"}, {"__lx_inv", "__lx_j"},
+        {"__lx_decode", "__lx_qd"}, {"__lx_chain", "__lx_qc"},
+        {"__lx_debug", "__lx_qg"}
     };
     for (const auto& rename : generated_names) {
         for (std::size_t position = generated.find(rename.first);
