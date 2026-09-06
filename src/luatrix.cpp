@@ -1060,8 +1060,44 @@ static std::string generate_bootstrap(const std::string& source,
 
     std::ostringstream code;
     code << "--[Luatrix | LTRIX]\n";
-    code << "local __lx_args={...};";
+    code << "local __lx_args={...};"
+         << "local __lx_type=type;local __lx_pcall=pcall;local __lx_rawget=rawget;"
+         << "local __lx_string=string;local __lx_table=table;"
+         << "local __lx_char=__lx_string and __lx_string.char;"
+         << "local __lx_concat=__lx_table and __lx_table.concat;"
+         << "local __lx_loader=loadstring or load;"
+         << "local __lx_global=__lx_type(_G)==\"table\" and _G or nil;"
+         << "local __lx_suspicious={\"hookfunction\",\"hookmetamethod\","
+            "\"newcclosure\",\"getgenv\",\"getrenv\",\"getgc\","
+            "\"getconnections\",\"identifyexecutor\",\"isexecutorclosure\","
+            "\"checkcaller\",\"syn\",\"fluxus\",\"krnl\"};";
     code << "local __lx_blob=" << lua_array(encrypted) << ";";
+    code << "local __lx_envcheck=function()"
+            "if __lx_type~=type or __lx_pcall~=pcall or __lx_rawget~=rawget "
+            "or __lx_type(__lx_loader)~=\"function\" or __lx_type(__lx_char)~=\"function\" "
+            "or __lx_type(__lx_concat)~=\"function\" then "
+            "error(\"Luatrix anti-tamper failure\") end;"
+            "if __lx_string~=string or __lx_table~=table or "
+            "__lx_string.char~=__lx_char or __lx_table.concat~=__lx_concat "
+            "or (loadstring or load)~=__lx_loader then "
+            "error(\"Luatrix anti-tamper failure\") end;"
+            "if __lx_global then for i=1,#__lx_suspicious do "
+            "if __lx_rawget(__lx_global,__lx_suspicious[i])~=nil then "
+            "error(\"Luatrix hostile environment\") end end end;"
+            "local probe_ok,probe_value=__lx_pcall(function() "
+            "return __lx_char(76,84,82,73,88)==__lx_concat({\"L\",\"T\",\"R\",\"I\",\"X\"}) "
+            "end);if not probe_ok or not probe_value then "
+            "error(\"Luatrix anti-tamper failure\") end;"
+            "local game_object=__lx_global and __lx_rawget(__lx_global,\"game\");"
+            "if game_object~=nil then local service_ok,run_service=__lx_pcall(function() "
+            "return game_object:GetService(\"RunService\") end);"
+            "if not service_ok or run_service==nil then "
+            "error(\"Luatrix Roblox environment failure\") end;"
+            "local studio_ok,is_studio=__lx_pcall(function() "
+            "return run_service:IsStudio() end);"
+            "if not studio_ok or __lx_type(is_studio)~=\"boolean\" then "
+            "error(\"Luatrix Roblox environment failure\") end end;"
+            "return true end;";
     code << "local __lx_ids={";
     for (std::size_t i = 0; i < mapping.size(); ++i) {
         if (i != 0) code << ',';
@@ -1087,19 +1123,17 @@ static std::string generate_bootstrap(const std::string& source,
     }
 
     code << "__lx_handlers[" << mapping[0]
-         << "]=function(vm)local sum,roll=0,17;"
+         << "]=function(vm)__lx_envcheck();local sum,roll=0,17;"
             "for i=1,#vm.blob do local b=vm.blob[i];"
             "sum=(sum+b)%1000003;roll=(roll*257+b+i-1)%1000003 end;"
             "local att=vm.seed%1000003;"
             "for i=1,#__lx_code do att=(att*33+__lx_code[i]+i)%1000003 end;"
-            "if sum~=vm.checksum or roll~=vm.rolling or "
-            "att~=vm.attestation or type(loadstring or load)~=\"function\" "
-            "or type(string.char)~=\"function\" or type(table.concat)~=\"function\" "
+            "if sum~=vm.checksum or roll~=vm.rolling or att~=vm.attestation "
             "then error(\"Luatrix VM integrity failure\") end;"
             "vm.verified=true end;";
 
     code << "__lx_handlers[" << mapping[1]
-         << "]=function(vm)local src={};local pos=1;"
+         << "]=function(vm)__lx_envcheck();local src={};local pos=1;"
             "while pos<=#vm.blob do local b=__lx_byte(pos);"
             "if b==255 then local count=__lx_byte(pos+1);"
             "local value=__lx_byte(pos+2);"
@@ -1108,22 +1142,22 @@ static std::string generate_bootstrap(const std::string& source,
             "vm.src=src end;";
 
     code << "__lx_handlers[" << mapping[2]
-         << "]=function(vm)local pieces={};local piece={};"
-            "for i=1,#vm.src do piece[#piece+1]=string.char(vm.src[i]);"
-            "if #piece==128 then pieces[#pieces+1]=table.concat(piece);"
-            "piece={} end end;if #piece>0 then pieces[#pieces+1]=table.concat(piece) end;"
-            "local text=table.concat(pieces);local loader=loadstring or load;"
+         << "]=function(vm)__lx_envcheck();local pieces={};local piece={};"
+            "for i=1,#vm.src do piece[#piece+1]=__lx_char(vm.src[i]);"
+            "if #piece==128 then pieces[#pieces+1]=__lx_concat(piece);"
+            "piece={} end end;if #piece>0 then pieces[#pieces+1]=__lx_concat(piece) end;"
+            "local text=__lx_concat(pieces);local loader=__lx_loader;"
             "local fn,err=loader(text,\"LTRIX\");text=nil;pieces=nil;piece=nil;"
             "for i=1,#vm.src do vm.src[i]=0 end;vm.src=nil;"
             "if type(fn)~=\"function\" then error(\"Luatrix payload rejected: \"..tostring(err)) end;"
             "vm.fn=fn end;";
 
     code << "__lx_handlers[" << mapping[3]
-         << "]=function(vm)if vm.blob then for i=1,#vm.blob do vm.blob[i]=0 end end;"
+         << "]=function(vm)__lx_envcheck();if vm.blob then for i=1,#vm.blob do vm.blob[i]=0 end end;"
             "vm.blob=nil;vm.key=0;vm.checksum=0;vm.rolling=0;vm.wiped=true end;";
 
     code << "__lx_handlers[" << mapping[4]
-         << "]=function(vm)if not vm.fn or not vm.wiped then "
+         << "]=function(vm)__lx_envcheck();if not vm.fn or not vm.wiped then "
             "error(\"Luatrix VM lifecycle failure\") end;vm.halted=true end;";
 
     code << "while not __lx_vm.halted do local op=__lx_code[__lx_vm.pc];"
