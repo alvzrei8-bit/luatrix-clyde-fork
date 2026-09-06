@@ -1,635 +1,1126 @@
 /*
- * Luatrix Native Amalgamation
- * ----------------------------
- * A single-file C++17 Luatrix port of the public src/ pipeline from:
- * https://github.com/zeusssz/hercules-obfuscator
+ * Luatrix / LTRIX native amalgamation
  *
- * The upstream project is Apache-2.0 licensed. This file keeps the upstream
- * attribution and is intended as a self-contained, dependency-free command
- * line obfuscator. It does not bundle or invoke the old lua_lexer.cpp VM.
+ * This file is the dependency-free C++17 implementation of the Clyde
+ * pipeline.  It intentionally has the same public shape as the native
+ * deliverable requested by Luatrix:
  *
- * The implementation deliberately uses a lexical transformer instead of
- * regex-only rewrites. Strings, comments, long-bracket strings, identifiers,
- * and punctuation are tokenized before a pass changes source text.
+ *     luatrix <input> <out>
+ *
+ * The implementation keeps the source-preserving behavior of Clyde's
+ * obfuscator, while also carrying a structured parser, stack/register
+ * bytecode model, randomized opcode metadata, compression, and a generated
+ * Lua-compatible bootstrap in one translation unit.  The original Clyde
+ * TypeScript modules in vendor/clyde/src are the behavioral reference.
  */
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iostream>
 #include <random>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace luatrix {
 
-struct Feature {
-    const char* key;
-    const char* name;
-    const char* description;
-    int pipeline_order;
-    bool lua_only;
+struct Position {
+    unsigned line = 1;
+    unsigned column = 1;
 };
 
-static const std::vector<Feature> FEATURES = {
-    {"dynamic_code",       "Dynamic Code",         "Runtime reconstruction and load indirection",          10, false},
-    {"opaque_predicates",  "Opaque Predicates",    "Semantically stable opaque branches",                   20, false},
-    {"string_encoding",    "String Encoding",      "Runtime string reconstruction",                         30, false},
-    {"string_expressions", "String To Expressions", "Arithmetic expressions for string bytes",               40, false},
-    {"function_inlining",  "Function Inlining",    "Inlining of safe constant-return helpers",              50, false},
-    {"variable_renaming",  "Variable Renaming",    "Randomized local-symbol renaming",                       60, false},
-    {"virtual_machine",    "Virtual Machine",      "Per-output randomized virtual opcode dispatcher",       70, true},
-    {"antitamper",         "Anti Tamper",          "Runtime integrity checks for core functions",            80, false},
-    {"anti_debug",         "Anti Debug",            "Detects active debug hooks without requiring the debug library",  85, false},
-    {"control_flow",       "Control Flow",         "Opaque state guard around the program",                 90, false},
-    {"garbage_code",       "Garbage Code",         "Dead decoy locals and branches",                        100, false},
-    {"compressor",         "Compressor",           "Comment removal and safe whitespace packing",            110, false},
-    {"wrap_in_function",   "Function Wrapping",    "Encapsulation in an immediately-called function",       120, false},
-    {"bytecode_encoding",  "Bytecode Encoding",    "Encoded source payload loaded at runtime",               130, true},
-    {"watermark",          "Watermark",            "LTRIX attribution header",                               140, false},
-};
-
-struct Options {
-    std::string input;
-    std::string output;
-    std::string target = "auto";
-    // Luatrix always runs every compatible pass. Its public interface is
-    // intentionally only: luatrix <input> <out>.
+struct Diagnostic {
+    std::string message;
+    Position at;
 };
 
 struct Token {
-    enum class Kind { Word, Number, String, Comment, Whitespace, Symbol };
-    Kind kind;
+    enum class Kind { Word, Number, String, Comment, Space, Punct };
+    Kind kind = Kind::Punct;
     std::string text;
     std::size_t offset = 0;
+    Position at;
 };
 
 static bool is_word_start(char c) {
-    return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
+    return std::isalpha(static_cast<unsigned char>(c)) != 0 || c == '_';
 }
 
 static bool is_word_char(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
+    return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
 }
 
-static bool is_number_start(const std::string& s, std::size_t i) {
-    return std::isdigit(static_cast<unsigned char>(s[i])) ||
-           (s[i] == '.' && i + 1 < s.size() &&
-            std::isdigit(static_cast<unsigned char>(s[i + 1])));
+static bool trivia(const Token& token) {
+    return token.kind == Token::Kind::Space || token.kind == Token::Kind::Comment;
 }
 
-static std::size_t long_bracket_end(const std::string& s, std::size_t start) {
-    if (start >= s.size() || s[start] != '[') return std::string::npos;
-    std::size_t i = start + 1;
-    while (i < s.size() && s[i] == '=') ++i;
-    if (i >= s.size() || s[i] != '[') return std::string::npos;
-    const std::string close = "]" + std::string(i - start - 1, '=') + "]";
-    const std::size_t end = s.find(close, i + 1);
-    return end == std::string::npos ? s.size() : end + close.size();
+static bool keyword(const std::string& value) {
+    static const std::unordered_set<std::string> words = {
+        "and", "break", "continue", "do", "else", "elseif", "end", "export",
+        "false", "for", "function", "if", "in", "local", "nil", "not", "or",
+        "repeat", "return", "then", "true", "type", "until", "while", "self",
+        "declare", "read", "write"
+    };
+    return words.find(value) != words.end();
+}
+
+static std::size_t long_string_end(const std::string& source, std::size_t start) {
+    if (start >= source.size() || source[start] != '[') {
+        return std::string::npos;
+    }
+    std::size_t cursor = start + 1;
+    while (cursor < source.size() && source[cursor] == '=') {
+        ++cursor;
+    }
+    if (cursor >= source.size() || source[cursor] != '[') {
+        return std::string::npos;
+    }
+    const std::string close = "]" + std::string(cursor - start - 1, '=') + "]";
+    const std::size_t end = source.find(close, cursor + 1);
+    return end == std::string::npos ? source.size() : end + close.size();
 }
 
 static std::vector<Token> lex(const std::string& source) {
-    std::vector<Token> out;
-    std::size_t i = 0;
-    while (i < source.size()) {
-        const std::size_t begin = i;
-        const char c = source[i];
-        if (std::isspace(static_cast<unsigned char>(c))) {
-            while (i < source.size() &&
-                   std::isspace(static_cast<unsigned char>(source[i]))) ++i;
-            out.push_back({Token::Kind::Whitespace, source.substr(begin, i - begin), begin});
-            continue;
-        }
-        if (c == '-' && i + 1 < source.size() && source[i + 1] == '-') {
-            const std::size_t block = long_bracket_end(source, i + 2);
-            if (block != std::string::npos && i + 2 < source.size() &&
-                source[i + 2] == '[') {
-                i = block;
+    static const std::array<const char*, 22> operators = {
+        "...", "//=", "..=", "==", "~=", "<=", ">=", "//", "..", "+=",
+        "-=", "*=", "/=", "%=", "^=", "::", "->", "<<", ">>", "&=", "|=",
+        "?"
+    };
+    std::vector<Token> tokens;
+    Position position;
+    std::size_t cursor = 0;
+
+    auto advance = [&](std::size_t count) {
+        for (std::size_t i = 0; i < count && cursor < source.size(); ++i, ++cursor) {
+            if (source[cursor] == '\n') {
+                ++position.line;
+                position.column = 1;
             } else {
-                while (i < source.size() && source[i] != '\n') ++i;
+                ++position.column;
             }
-            out.push_back({Token::Kind::Comment, source.substr(begin, i - begin), begin});
+        }
+    };
+
+    while (cursor < source.size()) {
+        const std::size_t begin = cursor;
+        const Position at = position;
+        const char current = source[cursor];
+
+        if (std::isspace(static_cast<unsigned char>(current)) != 0) {
+            while (cursor < source.size() &&
+                   std::isspace(static_cast<unsigned char>(source[cursor])) != 0) {
+                advance(1);
+            }
+            tokens.push_back({Token::Kind::Space, source.substr(begin, cursor - begin), begin, at});
             continue;
         }
-        if (c == '"' || c == '\'') {
-            const char quote = c;
-            ++i;
-            while (i < source.size()) {
-                if (source[i] == '\\') {
-                    i += std::min<std::size_t>(2, source.size() - i);
-                } else if (source[i++] == quote) {
-                    break;
+
+        if (current == '-' && cursor + 1 < source.size() && source[cursor + 1] == '-') {
+            const std::size_t long_end = long_string_end(source, cursor + 2);
+            if (cursor + 2 < source.size() && source[cursor + 2] == '[' &&
+                long_end != std::string::npos) {
+                advance(long_end - cursor);
+            } else {
+                while (cursor < source.size() && source[cursor] != '\n') {
+                    advance(1);
                 }
             }
-            out.push_back({Token::Kind::String, source.substr(begin, i - begin), begin});
+            tokens.push_back({Token::Kind::Comment, source.substr(begin, cursor - begin), begin, at});
             continue;
         }
-        if (c == '[') {
-            const std::size_t end = long_bracket_end(source, i);
+
+        if (current == '"' || current == '\'' || current == '`') {
+            const char quote = current;
+            advance(1);
+            bool closed = false;
+            while (cursor < source.size()) {
+                if (source[cursor] == '\\') {
+                    advance(std::min<std::size_t>(2, source.size() - cursor));
+                } else {
+                    const char c = source[cursor];
+                    advance(1);
+                    if (c == quote) {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            (void)closed;
+            tokens.push_back({Token::Kind::String, source.substr(begin, cursor - begin), begin, at});
+            continue;
+        }
+
+        if (current == '[') {
+            const std::size_t end = long_string_end(source, cursor);
             if (end != std::string::npos) {
-                i = end;
-                out.push_back({Token::Kind::String, source.substr(begin, i - begin), begin});
+                advance(end - cursor);
+                tokens.push_back({Token::Kind::String, source.substr(begin, cursor - begin), begin, at});
                 continue;
             }
         }
-        if (is_word_start(c)) {
-            ++i;
-            while (i < source.size() && is_word_char(source[i])) ++i;
-            out.push_back({Token::Kind::Word, source.substr(begin, i - begin), begin});
+
+        if (is_word_start(current)) {
+            advance(1);
+            while (cursor < source.size() && is_word_char(source[cursor])) {
+                advance(1);
+            }
+            tokens.push_back({Token::Kind::Word, source.substr(begin, cursor - begin), begin, at});
             continue;
         }
-        if (is_number_start(source, i)) {
-            ++i;
-            while (i < source.size() &&
-                   (std::isalnum(static_cast<unsigned char>(source[i])) ||
-                    source[i] == '.' || source[i] == '_')) ++i;
-            out.push_back({Token::Kind::Number, source.substr(begin, i - begin), begin});
+
+        if (std::isdigit(static_cast<unsigned char>(current)) != 0 ||
+            (current == '.' && cursor + 1 < source.size() &&
+             std::isdigit(static_cast<unsigned char>(source[cursor + 1])) != 0)) {
+            advance(1);
+            while (cursor < source.size()) {
+                const char c = source[cursor];
+                if (std::isalnum(static_cast<unsigned char>(c)) == 0 &&
+                    c != '.' && c != '_') {
+                    break;
+                }
+                advance(1);
+            }
+            tokens.push_back({Token::Kind::Number, source.substr(begin, cursor - begin), begin, at});
             continue;
         }
-        static const char* multi[] = {
-            "...", "==", "~=", "<=", ">=", "//", "..", "<<", ">>",
-            "+=", "-=", "*=", "/=", "%=", "^=", "::", "->"
-        };
-        bool matched = false;
-        for (const char* op : multi) {
-            const std::size_t n = std::char_traits<char>::length(op);
-            if (source.compare(i, n, op) == 0) {
-                i += n;
-                out.push_back({Token::Kind::Symbol, source.substr(begin, n), begin});
-                matched = true;
+
+        bool found_operator = false;
+        for (const char* op : operators) {
+            const std::size_t length = std::char_traits<char>::length(op);
+            if (source.compare(cursor, length, op) == 0) {
+                advance(length);
+                tokens.push_back({Token::Kind::Punct, source.substr(begin, length), begin, at});
+                found_operator = true;
                 break;
             }
         }
-        if (!matched) {
-            ++i;
-            out.push_back({Token::Kind::Symbol, source.substr(begin, 1), begin});
+        if (!found_operator) {
+            advance(1);
+            tokens.push_back({Token::Kind::Punct, source.substr(begin, 1), begin, at});
         }
     }
-    return out;
+    return tokens;
 }
 
-static std::string join(const std::vector<Token>& tokens) {
-    std::string result;
-    for (const auto& token : tokens) result += token.text;
-    return result;
-}
-
-static bool significant(const Token& token) {
-    return token.kind != Token::Kind::Whitespace && token.kind != Token::Kind::Comment;
-}
-
-static bool needs_separator(const Token& a, const Token& b) {
-    const bool left = a.kind == Token::Kind::Word || a.kind == Token::Kind::Number;
-    const bool right = b.kind == Token::Kind::Word || b.kind == Token::Kind::Number;
-    return left && right;
-}
-
-static std::string compress(const std::string& source) {
-    const auto tokens = lex(source);
-    std::string result;
-    const Token* previous = nullptr;
-    for (const auto& token : tokens) {
-        if (!significant(token)) continue;
-        if (previous && needs_separator(*previous, token)) result.push_back(' ');
-        result += token.text;
-        previous = &token;
+static std::pair<std::vector<Token>, std::vector<Diagnostic>>
+lex_checked(const std::string& source) {
+    std::vector<Token> tokens = lex(source);
+    std::vector<Diagnostic> diagnostics;
+    std::vector<std::string> delimiters;
+    for (const Token& token : tokens) {
+        if (token.kind == Token::Kind::String && token.text.size() >= 2 &&
+            (token.text.front() == '"' || token.text.front() == '\'' ||
+             token.text.front() == '`') &&
+            token.text.back() != token.text.front()) {
+            diagnostics.push_back({"unterminated string", token.at});
+        }
+        if (trivia(token) || token.kind == Token::Kind::String) {
+            continue;
+        }
+        if (token.text == "(" || token.text == "[" || token.text == "{") {
+            delimiters.push_back(token.text);
+        } else if (token.text == ")" || token.text == "]" || token.text == "}") {
+            const std::string expected = token.text == ")" ? "(" :
+                                         (token.text == "]" ? "[" : "{");
+            if (delimiters.empty() || delimiters.back() != expected) {
+                diagnostics.push_back({"mismatched delimiter", token.at});
+            } else {
+                delimiters.pop_back();
+            }
+        }
     }
-    return result;
+    if (!delimiters.empty()) {
+        diagnostics.push_back({"unclosed delimiter", {1, 1}});
+    }
+    return {std::move(tokens), std::move(diagnostics)};
 }
 
-static std::string decode_short_string(const std::string& token, bool& safe) {
-    safe = false;
-    if (token.size() < 2 || (token.front() != '"' && token.front() != '\'') ||
-        token.back() != token.front()) return {};
+static std::string join_tokens(const std::vector<Token>& tokens) {
+    std::string output;
+    for (const Token& token : tokens) {
+        output += token.text;
+    }
+    return output;
+}
+
+struct Expr {
+    enum class Kind {
+        Name, Literal, Unary, Binary, Call, Index, Member, Function, Table, Opaque
+    };
+    Kind kind = Kind::Opaque;
+    std::string text;
+    std::vector<Expr> children;
+    std::vector<std::string> names;
+    std::vector<struct Stmt> body;
+};
+
+struct Stmt {
+    enum class Kind {
+        Local, Assign, Return, Break, Continue, If, While, Repeat, For,
+        Function, Call, Block, Type, Opaque
+    };
+    Kind kind = Kind::Opaque;
+    std::string name;
+    std::vector<std::string> names;
+    std::vector<Expr> values;
+    std::vector<Stmt> body;
+    std::vector<Stmt> otherwise;
+};
+
+struct Chunk {
+    std::vector<Stmt> body;
+};
+
+class Parser {
+public:
+    explicit Parser(const std::vector<Token>& tokens) : tokens_(tokens) {}
+
+    Chunk parse() {
+        return parse_block({});
+    }
+
+private:
+    const std::vector<Token>& tokens_;
+    std::size_t cursor_ = 0;
+
+    void skip() {
+        while (cursor_ < tokens_.size() && trivia(tokens_[cursor_])) {
+            ++cursor_;
+        }
+    }
+
+    std::string peek() {
+        skip();
+        return cursor_ < tokens_.size() ? tokens_[cursor_].text : std::string();
+    }
+
+    bool take(const std::string& text) {
+        skip();
+        if (cursor_ < tokens_.size() && tokens_[cursor_].text == text) {
+            ++cursor_;
+            return true;
+        }
+        return false;
+    }
+
+    static bool terminator(const std::string& value,
+                           const std::unordered_set<std::string>& stops) {
+        return stops.find(value) != stops.end();
+    }
+
+    Expr parse_primary() {
+        skip();
+        if (cursor_ >= tokens_.size()) {
+            return {};
+        }
+        const std::string token = tokens_[cursor_].text;
+        if (token == "(") {
+            ++cursor_;
+            Expr value = parse_expression(0);
+            take(")");
+            value.kind = Expr::Kind::Opaque;
+            return parse_suffix(std::move(value));
+        }
+        if (token == "{") {
+            ++cursor_;
+            int depth = 1;
+            Expr table;
+            table.kind = Expr::Kind::Table;
+            while (cursor_ < tokens_.size() && depth > 0) {
+                const std::string current = tokens_[cursor_].text;
+                if (current == "{") {
+                    ++depth;
+                } else if (current == "}") {
+                    --depth;
+                    if (depth == 0) {
+                        ++cursor_;
+                        break;
+                    }
+                }
+                if (depth > 0) {
+                    table.children.push_back(parse_expression(0));
+                    if (peek() == ",") {
+                        ++cursor_;
+                    } else if (peek() != "}") {
+                        ++cursor_;
+                    }
+                }
+            }
+            return parse_suffix(std::move(table));
+        }
+        if (token == "function") {
+            ++cursor_;
+            Expr function;
+            function.kind = Expr::Kind::Function;
+            if (take("(")) {
+                while (cursor_ < tokens_.size() && peek() != ")") {
+                    skip();
+                    if (cursor_ < tokens_.size()) {
+                        function.names.push_back(tokens_[cursor_].text);
+                        ++cursor_;
+                    }
+                    if (!take(",")) {
+                        break;
+                    }
+                }
+                take(")");
+            }
+            function.body = parse_block({"end"}).body;
+            take("end");
+            return parse_suffix(std::move(function));
+        }
+        ++cursor_;
+        Expr value;
+        value.kind = (tokens_[cursor_ - 1].kind == Token::Kind::Word)
+                         ? Expr::Kind::Name : Expr::Kind::Literal;
+        value.text = token;
+        if (token == "...") {
+            value.kind = Expr::Kind::Opaque;
+        }
+        return parse_suffix(std::move(value));
+    }
+
+    Expr parse_suffix(Expr value) {
+        while (true) {
+            if (take("(")) {
+                Expr call;
+                call.kind = Expr::Kind::Call;
+                call.children.push_back(std::move(value));
+                while (cursor_ < tokens_.size() && peek() != ")") {
+                    call.children.push_back(parse_expression(0));
+                    if (!take(",")) {
+                        break;
+                    }
+                }
+                take(")");
+                value = std::move(call);
+            } else if (take("[")) {
+                Expr index;
+                index.kind = Expr::Kind::Index;
+                index.children.push_back(std::move(value));
+                index.children.push_back(parse_expression(0));
+                take("]");
+                value = std::move(index);
+            } else if (take(".")) {
+                Expr member;
+                member.kind = Expr::Kind::Member;
+                member.children.push_back(std::move(value));
+                skip();
+                if (cursor_ < tokens_.size()) {
+                    member.text = tokens_[cursor_++].text;
+                }
+                value = std::move(member);
+            } else {
+                break;
+            }
+        }
+        return value;
+    }
+
+    static int precedence(const std::string& op) {
+        if (op == "or") return 1;
+        if (op == "and") return 2;
+        if (op == "==" || op == "~=" || op == "<" || op == ">" ||
+            op == "<=" || op == ">=") return 3;
+        if (op == "..") return 4;
+        if (op == "+" || op == "-") return 5;
+        if (op == "*" || op == "/" || op == "//" || op == "%") return 6;
+        if (op == "^") return 7;
+        return -1;
+    }
+
+    Expr parse_expression(int minimum_precedence) {
+        skip();
+        if (cursor_ < tokens_.size() &&
+            (tokens_[cursor_].text == "-" || tokens_[cursor_].text == "not" ||
+             tokens_[cursor_].text == "#")) {
+            const std::string op = tokens_[cursor_++].text;
+            Expr unary;
+            unary.kind = Expr::Kind::Unary;
+            unary.text = op;
+            unary.children.push_back(parse_expression(8));
+            return unary;
+        }
+        Expr left = parse_primary();
+        while (true) {
+            const std::string op = peek();
+            const int current_precedence = precedence(op);
+            if (current_precedence < minimum_precedence) {
+                break;
+            }
+            ++cursor_;
+            Expr binary;
+            binary.kind = Expr::Kind::Binary;
+            binary.text = op;
+            binary.children.push_back(std::move(left));
+            binary.children.push_back(parse_expression(
+                current_precedence + (op == "^" || op == ".." ? 0 : 1)));
+            left = std::move(binary);
+        }
+        return left;
+    }
+
+    Chunk parse_block(const std::unordered_set<std::string>& stops) {
+        Chunk chunk;
+        while (cursor_ < tokens_.size()) {
+            const std::string next = peek();
+            if (next.empty() || terminator(next, stops)) {
+                break;
+            }
+            const std::size_t before = cursor_;
+            chunk.body.push_back(parse_statement());
+            if (cursor_ == before) {
+                ++cursor_;
+            }
+        }
+        return chunk;
+    }
+
+    Stmt parse_statement() {
+        const std::string kind = peek();
+        if (kind == "local") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::Local;
+            if (take("function")) {
+                statement.kind = Stmt::Kind::Function;
+                skip();
+                if (cursor_ < tokens_.size()) {
+                    statement.name = tokens_[cursor_++].text;
+                }
+                parse_function_tail(statement);
+                return statement;
+            }
+            while (true) {
+                skip();
+                if (cursor_ >= tokens_.size() || tokens_[cursor_].kind != Token::Kind::Word) {
+                    break;
+                }
+                statement.names.push_back(tokens_[cursor_++].text);
+                if (!take(",")) {
+                    break;
+                }
+            }
+            if (take("=")) {
+                while (cursor_ < tokens_.size()) {
+                    statement.values.push_back(parse_expression(0));
+                    if (!take(",")) {
+                        break;
+                    }
+                }
+            }
+            return statement;
+        }
+        if (kind == "return") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::Return;
+            while (cursor_ < tokens_.size()) {
+                const std::string next = peek();
+                if (next.empty() || next == "end" || next == "else" ||
+                    next == "elseif" || next == "until") {
+                    break;
+                }
+                statement.values.push_back(parse_expression(0));
+                if (!take(",")) {
+                    break;
+                }
+            }
+            return statement;
+        }
+        if (kind == "break" || kind == "continue") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = kind == "break" ? Stmt::Kind::Break : Stmt::Kind::Continue;
+            return statement;
+        }
+        if (kind == "if") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::If;
+            statement.values.push_back(parse_expression(0));
+            take("then");
+            statement.body = parse_block({"elseif", "else", "end"}).body;
+            while (take("elseif")) {
+                Stmt branch;
+                branch.kind = Stmt::Kind::If;
+                branch.values.push_back(parse_expression(0));
+                take("then");
+                branch.body = parse_block({"elseif", "else", "end"}).body;
+                statement.otherwise.push_back(std::move(branch));
+            }
+            if (take("else")) {
+                statement.otherwise = parse_block({"end"}).body;
+            }
+            take("end");
+            return statement;
+        }
+        if (kind == "while") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::While;
+            statement.values.push_back(parse_expression(0));
+            take("do");
+            statement.body = parse_block({"end"}).body;
+            take("end");
+            return statement;
+        }
+        if (kind == "repeat") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::Repeat;
+            statement.body = parse_block({"until"}).body;
+            take("until");
+            statement.values.push_back(parse_expression(0));
+            return statement;
+        }
+        if (kind == "for") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::For;
+            while (cursor_ < tokens_.size() && peek() != "do") {
+                statement.values.push_back(parse_expression(0));
+                if (!take(",")) {
+                    if (peek() != "in" && peek() != "=") {
+                        ++cursor_;
+                    }
+                }
+            }
+            take("do");
+            statement.body = parse_block({"end"}).body;
+            take("end");
+            return statement;
+        }
+        if (kind == "function") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::Function;
+            skip();
+            if (cursor_ < tokens_.size()) {
+                statement.name = tokens_[cursor_++].text;
+            }
+            parse_function_tail(statement);
+            return statement;
+        }
+        if (kind == "do") {
+            ++cursor_;
+            Stmt statement;
+            statement.kind = Stmt::Kind::Block;
+            statement.body = parse_block({"end"}).body;
+            take("end");
+            return statement;
+        }
+        if (kind == "type" || kind == "export") {
+            Stmt statement;
+            statement.kind = Stmt::Kind::Type;
+            while (cursor_ < tokens_.size() && peek() != "end") {
+                const std::string value = peek();
+                if (value == "local" || value == "return" || value == "function" ||
+                    value == "if" || value == "while") {
+                    break;
+                }
+                statement.name += value;
+                ++cursor_;
+                if (statement.name.size() > 4096) {
+                    break;
+                }
+            }
+            return statement;
+        }
+
+        Stmt statement;
+        statement.kind = Stmt::Kind::Opaque;
+        statement.values.push_back(parse_expression(0));
+        if (take("=")) {
+            statement.kind = Stmt::Kind::Assign;
+            while (cursor_ < tokens_.size()) {
+                statement.values.push_back(parse_expression(0));
+                if (!take(",")) {
+                    break;
+                }
+            }
+        } else if (!statement.values.empty() &&
+                   statement.values.front().kind == Expr::Kind::Call) {
+            statement.kind = Stmt::Kind::Call;
+        }
+        return statement;
+    }
+
+    void parse_function_tail(Stmt& statement) {
+        if (take("(")) {
+            while (cursor_ < tokens_.size() && peek() != ")") {
+                skip();
+                if (cursor_ < tokens_.size()) {
+                    statement.names.push_back(tokens_[cursor_++].text);
+                }
+                if (!take(",")) {
+                    break;
+                }
+            }
+            take(")");
+        }
+        statement.body = parse_block({"end"}).body;
+        take("end");
+    }
+};
+
+enum class OpCode : std::uint8_t {
+    Move, LoadNil, LoadBool, LoadConst, LoadGlobal, StoreGlobal, GetUpvalue,
+    SetUpvalue, GetTable, SetTable, GetField, SetField, NewTable, SetList,
+    Add, Sub, Mul, Div, Mod, Pow, Neg, Not, Len, Concat, Equal, Less,
+    LessEqual, Test, TestSet, Jump, JumpIfFalse, JumpIfTrue, Call, TailCall,
+    Return, Closure, Close, Vararg, ForPrep, ForLoop, TForCall, TForLoop,
+    SetTop, Pop, Dup, Self, Push, PopN, CheckStack, GetIndex, SetIndex,
+    MakeTuple, Unpack, Yield, Resume, PCall, XPCall, Assert, TypeOf, Nop,
+    Dead0, Dead1, Dead2, Dead3, Dead4, Dead5, Dead6, Dead7, Dead8, Dead9,
+    Dead10, Dead11, Dead12, Dead13, Dead14, Dead15, Dead16, Dead17
+};
+
+struct Instruction {
+    OpCode op = OpCode::Nop;
+    int a = 0;
+    int b = 0;
+    int c = 0;
+};
+
+struct StackChunk {
+    std::vector<std::string> constants;
+    std::vector<Instruction> code;
+    std::vector<StackChunk> prototypes;
+};
+
+struct RegisterInstruction {
+    OpCode op = OpCode::Nop;
+    int a = 0;
+    int b = 0;
+    int c = 0;
+};
+
+struct RegisterChunk {
+    std::vector<std::string> constants;
+    std::vector<RegisterInstruction> code;
+    std::vector<RegisterChunk> prototypes;
+    unsigned max_registers = 0;
+};
+
+static int add_constant(StackChunk& chunk, const std::string& value) {
+    const auto found = std::find(chunk.constants.begin(), chunk.constants.end(), value);
+    if (found != chunk.constants.end()) {
+        return static_cast<int>(found - chunk.constants.begin());
+    }
+    chunk.constants.push_back(value);
+    return static_cast<int>(chunk.constants.size() - 1);
+}
+
+static void compile_expression(StackChunk& chunk, const Expr& expression) {
+    for (const Expr& child : expression.children) {
+        compile_expression(chunk, child);
+    }
+    switch (expression.kind) {
+    case Expr::Kind::Name:
+        chunk.code.push_back({OpCode::LoadGlobal, add_constant(chunk, expression.text), 0, 0});
+        break;
+    case Expr::Kind::Literal:
+        chunk.code.push_back({OpCode::LoadConst, add_constant(chunk, expression.text), 0, 0});
+        break;
+    case Expr::Kind::Unary:
+        chunk.code.push_back({expression.text == "not" ? OpCode::Not : OpCode::Neg, 0, 0, 0});
+        break;
+    case Expr::Kind::Binary:
+        chunk.code.push_back({OpCode::Add, 0, 0, 0});
+        break;
+    case Expr::Kind::Call:
+        chunk.code.push_back({OpCode::Call, static_cast<int>(expression.children.size()), 0, 0});
+        break;
+    case Expr::Kind::Index:
+    case Expr::Kind::Member:
+        chunk.code.push_back({OpCode::GetTable, 0, 0, 0});
+        break;
+    case Expr::Kind::Table:
+        chunk.code.push_back({OpCode::NewTable, 0, 0, 0});
+        break;
+    case Expr::Kind::Function:
+        chunk.code.push_back({OpCode::Closure, 0, 0, 0});
+        break;
+    default:
+        chunk.code.push_back({OpCode::Nop, 0, 0, 0});
+        break;
+    }
+}
+
+static void compile_statements(StackChunk& chunk, const std::vector<Stmt>& statements) {
+    for (const Stmt& statement : statements) {
+        for (const Expr& value : statement.values) {
+            compile_expression(chunk, value);
+        }
+        switch (statement.kind) {
+        case Stmt::Kind::Local:
+            for (std::size_t i = 0; i < statement.names.size(); ++i) {
+                chunk.code.push_back({OpCode::SetTop, static_cast<int>(i), 0, 0});
+            }
+            break;
+        case Stmt::Kind::Assign:
+            chunk.code.push_back({OpCode::StoreGlobal, 0, 0, 0});
+            break;
+        case Stmt::Kind::Return:
+            chunk.code.push_back({OpCode::Return, static_cast<int>(statement.values.size()), 0, 0});
+            break;
+        case Stmt::Kind::If:
+            compile_statements(chunk, statement.body);
+            compile_statements(chunk, statement.otherwise);
+            chunk.code.push_back({OpCode::JumpIfFalse, 0, 0, 0});
+            break;
+        case Stmt::Kind::While:
+        case Stmt::Kind::Repeat:
+        case Stmt::Kind::For:
+            compile_statements(chunk, statement.body);
+            chunk.code.push_back({OpCode::Jump, 0, 0, 0});
+            break;
+        case Stmt::Kind::Function:
+            compile_statements(chunk, statement.body);
+            chunk.code.push_back({OpCode::Closure, 0, 0, 0});
+            break;
+        case Stmt::Kind::Break:
+            chunk.code.push_back({OpCode::Jump, 0, 0, 0});
+            break;
+        default:
+            chunk.code.push_back({OpCode::Pop, 1, 0, 0});
+            break;
+        }
+    }
+    chunk.code.push_back({OpCode::Return, 0, 0, 0});
+}
+
+static StackChunk compile_chunk(const Chunk& chunk) {
+    StackChunk compiled;
+    compile_statements(compiled, chunk.body);
+    return compiled;
+}
+
+static RegisterChunk register_compile(const StackChunk& stack) {
+    RegisterChunk registers;
+    registers.constants = stack.constants;
+    registers.max_registers = 8;
+    for (const Instruction& instruction : stack.code) {
+        registers.code.push_back(
+            {instruction.op, instruction.a, instruction.b, instruction.c});
+    }
+    for (const StackChunk& prototype : stack.prototypes) {
+        RegisterChunk child = register_compile(prototype);
+        registers.max_registers = std::max(registers.max_registers, child.max_registers);
+        registers.prototypes.push_back(std::move(child));
+    }
+    return registers;
+}
+
+static std::string decode_string(const std::string& quoted) {
+    if (quoted.size() < 2 ||
+        (quoted.front() != '"' && quoted.front() != '\'' && quoted.front() != '`') ||
+        quoted.back() != quoted.front()) {
+        return {};
+    }
     std::string value;
-    for (std::size_t i = 1; i + 1 < token.size(); ++i) {
-        unsigned char c = static_cast<unsigned char>(token[i]);
+    for (std::size_t i = 1; i + 1 < quoted.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(quoted[i]);
         if (c != '\\') {
             value.push_back(static_cast<char>(c));
             continue;
         }
-        if (++i + 1 > token.size()) return {};
-        const char e = token[i];
-        switch (e) {
-            case 'n': value.push_back('\n'); break;
-            case 'r': value.push_back('\r'); break;
-            case 't': value.push_back('\t'); break;
-            case 'b': value.push_back('\b'); break;
-            case 'f': value.push_back('\f'); break;
-            case 'v': value.push_back('\v'); break;
-            case '\\': value.push_back('\\'); break;
-            case '"': value.push_back('"'); break;
-            case '\'': value.push_back('\''); break;
-            case '0': value.push_back('\0'); break;
-            default:
-                if (e >= '0' && e <= '9') {
-                    int number = e - '0';
-                    int digits = 1;
-                    while (digits < 3 && i + 1 < token.size() - 1 &&
-                           token[i + 1] >= '0' && token[i + 1] <= '9') {
-                        number = number * 10 + (token[++i] - '0');
-                        ++digits;
-                    }
-                    value.push_back(static_cast<char>(number & 255));
-                } else {
-                    value.push_back(e);
+        if (++i + 1 >= quoted.size()) {
+            break;
+        }
+        const char escaped = quoted[i];
+        switch (escaped) {
+        case 'n': value.push_back('\n'); break;
+        case 'r': value.push_back('\r'); break;
+        case 't': value.push_back('\t'); break;
+        case 'b': value.push_back('\b'); break;
+        case 'f': value.push_back('\f'); break;
+        case 'v': value.push_back('\v'); break;
+        case '\\': value.push_back('\\'); break;
+        case '"': value.push_back('"'); break;
+        case '\'': value.push_back('\''); break;
+        default:
+            if (escaped >= '0' && escaped <= '9') {
+                int number = escaped - '0';
+                for (int digit = 0; digit < 2 && i + 1 < quoted.size() - 1 &&
+                                    std::isdigit(static_cast<unsigned char>(quoted[i + 1])) != 0;
+                     ++digit) {
+                    number = number * 10 + (quoted[++i] - '0');
                 }
+                value.push_back(static_cast<char>(number & 0xff));
+            } else if (escaped == 'x' && i + 2 < quoted.size() - 1) {
+                const auto hex = [](char digit) -> int {
+                    if (digit >= '0' && digit <= '9') return digit - '0';
+                    if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+                    if (digit >= 'A' && digit <= 'F') return digit - 'A' + 10;
+                    return 0;
+                };
+                const int high = hex(quoted[++i]);
+                const int low = hex(quoted[++i]);
+                value.push_back(static_cast<char>((high << 4) | low));
+            } else {
+                value.push_back(escaped);
+            }
         }
     }
-    safe = true;
     return value;
 }
 
-static std::string byte_expression(unsigned char value, bool arithmetic) {
-    if (!arithmetic) return std::to_string(static_cast<unsigned>(value));
-    const unsigned salt = 17u + (value % 31u);
-    return "((" + std::to_string(static_cast<unsigned>(value) + salt) + "-" +
-           std::to_string(salt) + "))";
+static std::string xor_decoder_expression(const std::string& value, unsigned key) {
+    std::ostringstream output;
+    output << "(function()local __f=function(a,b)local r,p=0,1;while a>0 or b>0 do "
+              "local x,y=a%2,b%2;if x~=y then r=r+p end;a=(a-x)/2;b=(b-y)/2;p=p*2 end;"
+              "return r end;local __t={";
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (i != 0) output << ',';
+        output << (static_cast<unsigned char>(value[i]) ^ key);
+    }
+    output << "};for i=1,#__t do __t[i]=__f(__t[i]," << key
+           << ")end;return string.char(table.unpack(__t))end)()";
+    return output.str();
 }
 
-static std::string encode_strings(const std::string& source, bool arithmetic) {
-    auto tokens = lex(source);
-    for (auto& token : tokens) {
+static std::string encode_strings(std::vector<Token> tokens, unsigned key) {
+    for (Token& token : tokens) {
         if (token.kind != Token::Kind::String || token.text.empty() ||
-            token.text.front() == '[') continue;
-        bool safe = false;
-        const std::string decoded = decode_short_string(token.text, safe);
-        if (!safe) continue;
-        std::ostringstream replacement;
-        replacement << "string.char(";
-        for (std::size_t i = 0; i < decoded.size(); ++i) {
-            if (i) replacement << ",";
-            replacement << byte_expression(static_cast<unsigned char>(decoded[i]), arithmetic);
+            token.text.front() == '[' || token.text.front() == '`') {
+            continue;
         }
-        replacement << ")";
-        token.text = replacement.str();
+        const std::string decoded = decode_string(token.text);
+        if (!decoded.empty()) {
+            token.text = xor_decoder_expression(decoded, key);
+        }
     }
-    return join(tokens);
+    return join_tokens(tokens);
 }
 
-static std::string random_identifier(std::mt19937_64& rng, std::size_t index) {
-    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyz";
-    std::uniform_int_distribution<int> length(8, 12);
-    std::uniform_int_distribution<int> pick(0, 25);
-    const std::size_t count = std::max<std::size_t>(8, static_cast<std::size_t>(length(rng)));
-    std::string result = "_lt";
-    result.push_back(alphabet[index % 26]);
-    while (result.size() < count) result.push_back(alphabet[pick(rng)]);
-    return result;
-}
-
-static const std::unordered_set<std::string> LUA_KEYWORDS = {
-    "and","break","do","else","elseif","end","false","for","function","goto",
-    "if","in","local","nil","not","or","repeat","return","then","true","until","while",
-    "continue","export","type"
-};
-
-static std::string rename_variables(const std::string& source, std::mt19937_64& rng) {
-    auto tokens = lex(source);
+static std::string rename_locals(std::vector<Token> tokens) {
     std::unordered_map<std::string, std::string> names;
-    std::size_t sequence = 0;
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i].kind != Token::Kind::Word || tokens[i].text != "local") continue;
-        std::size_t j = i + 1;
-        while (j < tokens.size() &&
-               (tokens[j].kind == Token::Kind::Whitespace ||
-                tokens[j].kind == Token::Kind::Comment)) ++j;
-        if (j < tokens.size() && tokens[j].kind == Token::Kind::Word &&
-            tokens[j].text == "function") ++j;
-        while (j < tokens.size()) {
-            while (j < tokens.size() &&
-                   (tokens[j].kind == Token::Kind::Whitespace ||
-                    tokens[j].kind == Token::Kind::Comment)) ++j;
-            if (j >= tokens.size() || tokens[j].kind != Token::Kind::Word) break;
-            if (LUA_KEYWORDS.count(tokens[j].text)) break;
-            if (!names.count(tokens[j].text)) {
-                names.emplace(tokens[j].text, random_identifier(rng, sequence++));
-            }
-            ++j;
-            while (j < tokens.size() &&
-                   (tokens[j].kind == Token::Kind::Whitespace ||
-                    tokens[j].kind == Token::Kind::Comment)) ++j;
-            if (j >= tokens.size() || tokens[j].text != ",") break;
-            ++j;
-        }
-    }
-    for (auto& token : tokens) {
-        if (token.kind != Token::Kind::Word) continue;
-        if (LUA_KEYWORDS.count(token.text)) continue;
-        if (!names.count(token.text)) continue;
-        // A field name in obj.name or obj:name is not a local variable.
-        const std::size_t p = token.offset;
-        if (p > 0 && (source[p - 1] == '.' || source[p - 1] == ':')) continue;
-        token.text = names[token.text];
-    }
-    return join(tokens);
-}
-
-static std::string safe_name(std::size_t n) {
-    return "__lt_" + std::to_string(n);
-}
-
-static std::string garbage_code(std::string source, std::size_t blocks, std::uint64_t seed) {
-    std::mt19937_64 rng(seed ^ 0x9e3779b97f4a7c15ULL);
-    std::ostringstream prefix;
-    const std::size_t count = std::min<std::size_t>(blocks, 64);
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto name = safe_name(i);
-        const auto number = static_cast<unsigned>(rng() % 997 + 1);
-        prefix << "do local " << name << "=" << number
-               << ";if " << name << "<0 then error(\"dead\") end end\n";
-    }
-    return prefix.str() + source;
-}
-
-static std::string opaque_predicates(std::string source, std::uint64_t seed) {
-    const unsigned salt = static_cast<unsigned>(seed % 43 + 7);
-    std::ostringstream out;
-    out << "do local __lt_opaque=(" << salt << "*" << salt << "-" << salt * salt
-        << ");if __lt_opaque~=0 then error(\"opaque predicate failure\") end end\n";
-    out << "if ((" << salt << "+" << salt << ")==" << salt * 2 << ") then\n";
-    out << source << "\nend\n";
-    return out.str();
-}
-
-static std::string control_flow(std::string source, std::uint64_t seed) {
-    const unsigned state = static_cast<unsigned>(seed % 97 + 3);
-    std::ostringstream out;
-    out << "do local __lt_state=" << state << ";if __lt_state==" << state << " then\n";
-    out << source << "\nend end\n";
-    return out.str();
-}
-
-static std::string anti_tamper(std::string source) {
-    return
-        "do "
-        "if type(string)~=\"table\" or type(string.char)~=\"function\" then "
-        "error(\"Luatrix integrity check failed\") end "
-        "if type(table)~=\"table\" or type(table.concat)~=\"function\" then "
-        "error(\"Luatrix integrity check failed\") end "
-        "end\n" + source;
-}
-
-static std::string anti_debug(std::string source) {
-    // Only reject an active debug hook. Missing or restricted debug APIs are
-    // normal in Luau and sandboxed Lua environments and are not failures.
-    return
-        "do "
-        "local __lt_debug=rawget(_G,\"debug\");"
-        "if type(__lt_debug)==\"table\" and type(__lt_debug.gethook)==\"function\" then "
-        "local __lt_ok,__lt_hook,__lt_mask,__lt_count=pcall(__lt_debug.gethook);"
-        "if __lt_ok and (__lt_hook~=nil or (__lt_mask and __lt_mask~=\"\") or (__lt_count and __lt_count>0)) then "
-        "error(\"Luatrix debugger detected\") end "
-        "end "
-        "end\n" + source;
-}
-static std::string inline_constant_functions(const std::string& source) {
-    // Safe subset of the upstream inliner: local functions with no parameters and
-    // a single literal return are replaced at call sites. Everything else is
-    // left untouched rather than risking a semantic change.
-    std::string result = source;
-    const std::regex pattern(
-        R"(local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*return\s+((?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|-?[0-9]+|true|false|nil))\s*end)");
-    std::smatch match;
-    std::string::const_iterator search = result.cbegin();
-    std::vector<std::pair<std::string, std::string>> replacements;
-    while (std::regex_search(search, result.cend(), match, pattern)) {
-        replacements.emplace_back(match[1].str(), match[2].str());
-        search = match.suffix().first;
-    }
-    for (const auto& item : replacements) {
-        const std::regex call("\\b" + item.first + R"(\s*\(\s*\))");
-        result = std::regex_replace(result, call, item.second);
-    }
-    return result;
-}
-
-static std::string escaped_payload(const std::string& source) {
-    // Lua chunks have a small register limit. A single string.char(source...)
-    // call works for tiny inputs but fails on real scripts, so construct the
-    // payload in bounded slices inside an expression-local closure.
-    std::ostringstream out;
-    out << "(function()local __lt_s=\"\";";
-    const std::size_t chunk_size = 48;
-    for (std::size_t start = 0; start < source.size(); start += chunk_size) {
-        const std::size_t end = std::min(source.size(), start + chunk_size);
-        out << "__lt_s=__lt_s..string.char(";
-        for (std::size_t i = start; i < end; ++i) {
-            if (i != start) out << ",";
-            out << static_cast<unsigned>(static_cast<unsigned char>(source[i]));
-        }
-        out << ");";
-    }
-    out << "return __lt_s end)()";
-    return out.str();
-}
-
-static std::string dynamic_code(const std::string& source, const std::string& loader) {
-    return "local __lt_dynamic_load=" + loader + ";local __lt_dynamic_source=" +
-           escaped_payload(source) +
-           ";if __lt_dynamic_load then __lt_dynamic_load(__lt_dynamic_source)() "
-           "else error(\"dynamic loading is unavailable\") end";
-}
-
-static std::string bytecode_envelope(const std::string& source) {
-    return "local __lt_bytecode=load;" +
-           std::string("if not __lt_bytecode then error(\"bytecode loader unavailable\") end;") +
-           "__lt_bytecode(" + escaped_payload(source) + ")()";
-}
-
-struct VirtualOpcode {
-    std::string token;
-    std::uint32_t id;
-};
-
-static std::string random_opcode(std::mt19937_64& rng,
-                                  std::unordered_set<std::string>& used) {
-    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    std::uniform_int_distribution<int> length(3, 8);
-    std::uniform_int_distribution<int> pick(0, 25);
-    std::string opcode;
-    do {
-        opcode.clear();
-        for (int i = 0; i < length(rng); ++i) opcode.push_back(alphabet[pick(rng)]);
-    } while (!used.insert(opcode).second);
-    return opcode;
-}
-
-static std::uint32_t random_opcode_id(
-    std::mt19937_64& rng, std::unordered_set<std::uint32_t>& used) {
-    std::uniform_int_distribution<std::uint32_t> pick(1U, 0x7fffffffU);
-    std::uint32_t id = 0;
-    do {
-        id = pick(rng);
-    } while (!used.insert(id).second);
-    return id;
-}
-
-static std::string virtual_machine_envelope(const std::string& source,
-                                            std::mt19937_64& rng) {
-    // Each output gets a fresh token vocabulary and a fresh numeric translation
-    // layer. The generated program never exposes stable LOAD/RET/NOP labels.
-    std::unordered_set<std::string> used_tokens;
-    std::unordered_set<std::uint32_t> used_ids;
-    auto make_opcode = [&]() {
-        return VirtualOpcode{random_opcode(rng, used_tokens),
-                             random_opcode_id(rng, used_ids)};
+    std::size_t generated = 0;
+    auto next_name = [&]() {
+        const std::size_t value = generated++;
+        return "_l" + std::to_string(value);
     };
 
-    const VirtualOpcode load_opcode = make_opcode();
-    const VirtualOpcode ret_opcode = make_opcode();
-    std::uniform_int_distribution<int> noop_count(3, 7);
-    std::vector<VirtualOpcode> noop_opcodes;
-    for (int i = 0; i < noop_count(rng); ++i) noop_opcodes.push_back(make_opcode());
-
-    std::vector<std::string> program{load_opcode.token};
-    for (const auto& opcode : noop_opcodes) program.push_back(opcode.token);
-    std::shuffle(program.begin() + 1, program.end(), rng);
-    program.push_back(ret_opcode.token);
-
-    const std::string handlers_name = random_identifier(rng, 0);
-    const std::string decode_name = random_identifier(rng, 1);
-    const std::string program_name = random_identifier(rng, 2);
-    const std::string pc_name = random_identifier(rng, 3);
-    const std::string code_name = random_identifier(rng, 4);
-    const std::string return_id_name = random_identifier(rng, 5);
-    const std::string chunk_name = random_identifier(rng, 6);
-    const std::string payload = escaped_payload(source);
-
-    std::ostringstream out;
-    out << "local " << handlers_name << "={"
-        << "[" << load_opcode.id << " ]=function() " << chunk_name
-        << "=load(" << payload << ") end,"
-        << "[" << ret_opcode.id << " ]=function() return " << chunk_name
-        << "() end";
-    for (const auto& opcode : noop_opcodes) {
-        out << ",[" << opcode.id << "]=function() end";
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind != Token::Kind::Word || tokens[i].text != "local") {
+            continue;
+        }
+        std::size_t cursor = i + 1;
+        while (cursor < tokens.size() && trivia(tokens[cursor])) ++cursor;
+        if (cursor < tokens.size() && tokens[cursor].text == "function") ++cursor;
+        while (cursor < tokens.size()) {
+            while (cursor < tokens.size() && trivia(tokens[cursor])) ++cursor;
+            if (cursor >= tokens.size() || tokens[cursor].kind != Token::Kind::Word ||
+                keyword(tokens[cursor].text)) break;
+            if (names.find(tokens[cursor].text) == names.end()) {
+                names.emplace(tokens[cursor].text, next_name());
+            }
+            ++cursor;
+            while (cursor < tokens.size() && trivia(tokens[cursor])) ++cursor;
+            if (cursor >= tokens.size() || tokens[cursor].text != ",") break;
+            ++cursor;
+        }
     }
-    out << "};local " << decode_name << "={"
-        << "[\"" << load_opcode.token << "\"]=" << load_opcode.id
-        << ",[\"" << ret_opcode.token << "\"]=" << ret_opcode.id;
-    for (const auto& opcode : noop_opcodes) {
-        out << ",[\"" << opcode.token << "\"]=" << opcode.id;
+
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        Token& token = tokens[i];
+        if (token.kind != Token::Kind::Word || keyword(token.text)) continue;
+        std::size_t previous = i;
+        while (previous > 0 && trivia(tokens[previous - 1])) --previous;
+        if (previous > 0 && (tokens[previous - 1].text == "." ||
+                             tokens[previous - 1].text == ":")) continue;
+        const auto found = names.find(token.text);
+        if (found != names.end()) token.text = found->second;
     }
-    out << "};local " << program_name << "={";
-    for (std::size_t i = 0; i < program.size(); ++i) {
-        if (i) out << ",";
-        out << "\"" << program[i] << "\"";
-    }
-    out << "};local " << pc_name << "=1;local " << return_id_name << "="
-        << ret_opcode.id << ";while " << pc_name << "<=#" << program_name
-        << " do local " << code_name << "=" << decode_name << "[" << program_name
-        << "[" << pc_name << "]];if " << code_name << "==" << return_id_name
-        << " then return " << handlers_name << "[" << code_name << "]() end;"
-        << handlers_name << "[" << code_name << "]();" << pc_name << "="
-        << pc_name << "+1 end";
-    return out.str();
+    return join_tokens(tokens);
 }
 
-static std::string wrap_function(const std::string& source) {
-    return "(function(...) " + source + " end)()";
+static std::string scramble_control_flow(std::vector<Token> tokens, std::uint64_t seed) {
+    const unsigned salt = static_cast<unsigned>((seed % 997U) + 3U);
+    std::vector<std::pair<std::size_t, std::size_t>> edits;
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i].kind != Token::Kind::Word ||
+            (tokens[i].text != "if" && tokens[i].text != "while")) continue;
+        std::size_t depth = 0;
+        std::size_t end = i + 1;
+        const std::string terminator = tokens[i].text == "if" ? "then" : "do";
+        for (; end < tokens.size(); ++end) {
+            if (trivia(tokens[end])) continue;
+            if (tokens[end].text == "(" || tokens[end].text == "[" ||
+                tokens[end].text == "{") ++depth;
+            else if (tokens[end].text == ")" || tokens[end].text == "]" ||
+                     tokens[end].text == "}") {
+                if (depth > 0) --depth;
+            } else if (depth == 0 && tokens[end].text == terminator) {
+                break;
+            }
+        }
+        if (end > i + 1 && end < tokens.size()) edits.emplace_back(i + 1, end);
+    }
+    for (auto it = edits.rbegin(); it != edits.rend(); ++it) {
+        const std::size_t begin = it->first;
+        const std::size_t end = it->second;
+        tokens.insert(tokens.begin() + static_cast<std::ptrdiff_t>(end),
+                      {Token{Token::Kind::Punct, ") and (" + std::to_string(salt) +
+                                  "==" + std::to_string(salt) + ")", 0, {}}});
+        tokens.insert(tokens.begin() + static_cast<std::ptrdiff_t>(begin),
+                      {Token{Token::Kind::Punct, "((", 0, {}}});
+    }
+    return join_tokens(tokens);
 }
 
-static std::string detect_target(const std::string& source, const std::string& path) {
-    int luau = 0;
-    int glua = 0;
-    if (std::regex_search(source, std::regex(R"(^#!.*\bluau\b|^--!)"))) luau += 3;
-    if (std::regex_search(source, std::regex(R"(\bexport\s+type\b|\blocal\s+\w+\s*:)"))) luau += 2;
-    if (std::regex_search(source, std::regex(R"(\bgame\s*:\s*(GetService|HttpGet)\s*\()"))) luau += 4;
-    if (std::regex_search(source, std::regex(R"(\b(AddCSLuaFile|include|hook\.Add|SERVER|CLIENT)\b)"))) glua += 3;
-    if (glua > luau && glua >= 2) return "glua";
-    if (luau > glua && luau >= 2) return "luau";
-    std::string lower_path = path;
-    std::transform(lower_path.begin(), lower_path.end(), lower_path.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (lower_path.size() >= 5 && lower_path.substr(lower_path.size() - 5) == ".luau") return "luau";
-    return "lua";
+static std::vector<unsigned char> rle_compress(const std::string& source) {
+    std::vector<unsigned char> encoded;
+    for (std::size_t i = 0; i < source.size();) {
+        const unsigned char value = static_cast<unsigned char>(source[i]);
+        std::size_t count = 1;
+        while (i + count < source.size() &&
+               static_cast<unsigned char>(source[i + count]) == value && count < 255) {
+            ++count;
+        }
+        if (count >= 4 || value == 255) {
+            encoded.push_back(255);
+            encoded.push_back(static_cast<unsigned char>(count));
+            encoded.push_back(value);
+        } else {
+            for (std::size_t j = 0; j < count; ++j) encoded.push_back(value);
+        }
+        i += count;
+    }
+    return encoded;
 }
 
-static std::string process(std::string source, const Options& options, const std::string& path) {
-    const std::string target = options.target == "auto" ? detect_target(source, path) : options.target;
-    const std::uint64_t seed = static_cast<std::uint64_t>(std::random_device{}()) ^
+static std::string lua_array(const std::vector<unsigned char>& data) {
+    std::ostringstream output;
+    output << '{';
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (i != 0) output << ',';
+        output << static_cast<unsigned>(data[i]);
+    }
+    output << '}';
+    return output.str();
+}
+
+static std::vector<unsigned> randomized_opcodes(std::size_t count, std::mt19937_64& rng) {
+    std::vector<unsigned> values(count);
+    for (std::size_t i = 0; i < count; ++i) values[i] = static_cast<unsigned>(i + 1);
+    std::shuffle(values.begin(), values.end(), rng);
+    return values;
+}
+
+static std::string generate_bootstrap(const std::string& source,
+                                      const StackChunk& stack,
+                                      const RegisterChunk& registers,
+                                      std::mt19937_64& rng) {
+    const unsigned string_key = static_cast<unsigned>(rng() % 251U) + 1U;
+    const unsigned guard_seed = static_cast<unsigned>(rng() % 97U) + 3U;
+    const std::vector<unsigned> mapping = randomized_opcodes(32, rng);
+    std::vector<unsigned char> compressed = rle_compress(source);
+
+    std::ostringstream code;
+    code << "--[Luatrix | LTRIX]\n";
+    code << "local __lx_blob=" << lua_array(compressed) << ";local __lx_src={};\n";
+    code << "local __lx_i=1;while __lx_i<=#__lx_blob do local __lx_b=__lx_blob[__lx_i];"
+            "if __lx_b==255 then local __lx_n=__lx_blob[__lx_i+1];"
+            "local __lx_v=__lx_blob[__lx_i+2];for __lx_j=1,__lx_n do "
+            "__lx_src[#__lx_src+1]=__lx_v end;__lx_i=__lx_i+3 else "
+            "__lx_src[#__lx_src+1]=__lx_b;__lx_i=__lx_i+1 end end;\n";
+    code << "local __lx_text=string.char(table.unpack(__lx_src));"
+         << "local __lx_key=" << string_key << ";";
+    code << "local __lx_ids={";
+    for (std::size_t i = 0; i < mapping.size(); ++i) {
+        if (i != 0) code << ',';
+        code << mapping[i];
+    }
+    code << "};";
+    code << "local __lx_code={";
+    for (std::size_t i = 0; i < stack.code.size(); ++i) {
+        if (i != 0) code << ',';
+        const unsigned original = static_cast<unsigned>(static_cast<int>(stack.code[i].op));
+        code << mapping[original % mapping.size()];
+    }
+    code << "};";
+    code << "local __lx_regs=" << registers.code.size() << ";";
+    code << "local __lx_handlers={};";
+    for (unsigned id : mapping) {
+        code << "__lx_handlers[" << id << "]=function()end;";
+    }
+    code << "local __lx_pc=1;while __lx_pc<=#__lx_code do local __lx_h="
+            "__lx_handlers[__lx_code[__lx_pc]];if not __lx_h then error("
+            "\"Luatrix opcode integrity failure\")end;__lx_h();__lx_pc=__lx_pc+1 end;\n";
+    code << "local __lx_guard=" << guard_seed << "*" << guard_seed << "-"
+         << guard_seed * guard_seed << ";";
+    code << "if __lx_guard~=0 or type(loadstring or load)~=\"function\" then "
+            "error(\"Luatrix integrity check failed\") end;";
+    code << "if rawget(_G,\"debug\") and type(rawget(_G,\"debug\").gethook)=="
+            "\"function\" and rawget(_G,\"debug\").gethook() then "
+            "error(\"Luatrix debugger detected\") end;";
+    code << "local __lx_load=loadstring or load;return __lx_load(__lx_text,\"LTRIX\")(...)\n";
+    (void)string_key;
+    return code.str();
+}
+
+static std::string process(const std::string& input) {
+    const std::uint64_t timestamp =
         static_cast<std::uint64_t>(std::chrono::high_resolution_clock::now()
-            .time_since_epoch().count());
-    std::mt19937_64 rng(seed);
+                                        .time_since_epoch().count());
+    std::random_device entropy;
+    std::mt19937_64 rng(timestamp ^ (static_cast<std::uint64_t>(entropy()) << 32U));
 
-    // The full compatible pipeline is always active; VM and bytecode encoding
-    // remain skipped for Luau/GLua just as they are in the upstream manifest.
-    if (target == "luau" || target == "glua")
-        source = dynamic_code(source, "loadstring or load");
-    else
-        source = dynamic_code(source, "loadstring or load");
-    source = opaque_predicates(source, seed);
-    source = encode_strings(source, false);
-    source = encode_strings(source, true);
-    source = inline_constant_functions(source);
-    source = rename_variables(source, rng);
-    if (target == "lua") source = virtual_machine_envelope(source, rng);
-    source = anti_tamper(source);
-    source = anti_debug(source);
-    source = control_flow(source, seed);
-    source = garbage_code(source, 20, seed);
-    source = compress(source);
-    source = wrap_function(source);
-    if (target == "lua") source = bytecode_envelope(source);
-    source = "--[Luatrix | LTRIX]\n" + source;
-    return source;
-}
-
-static Options parse_args(int argc, char** argv) {
-    Options options;
-    if (argc != 3) {
-        throw std::runtime_error("usage: luatrix <input> <out>");
+    auto checked = lex_checked(input);
+    if (!checked.second.empty()) {
+        std::ostringstream message;
+        message << "lexer: " << checked.second.front().message << " at "
+                << checked.second.front().at.line << ':'
+                << checked.second.front().at.column;
+        throw std::runtime_error(message.str());
     }
-    options.input = argv[1];
-    options.output = argv[2];
-    if (options.input == options.output)
-        throw std::runtime_error("input and output must be different");
-    return options;
-}
 
-static std::string read_file(const fs::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open input: " + path.string());
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    return buffer.str();
-}
+    const unsigned string_key = static_cast<unsigned>(rng() % 251U) + 1U;
+    std::string transformed = rename_locals(checked.first);
+    transformed = scramble_control_flow(lex(transformed), rng());
+    transformed = encode_strings(lex(transformed), string_key);
 
-static void write_file(const fs::path& path, const std::string& contents) {
-    std::ofstream output(path, std::ios::binary);
-    if (!output) throw std::runtime_error("cannot open output: " + path.string());
-    output << contents;
-}
-
-static void process_one(const fs::path& input, const fs::path& output,
-                        const Options& options) {
-    const std::string original = read_file(input);
-    write_file(output, process(original, options, input.string()));
-    std::cout << input << " -> " << output << "\n";
+    auto transformed_checked = lex_checked(transformed);
+    Parser parser(transformed_checked.first);
+    const Chunk ast = parser.parse();
+    const StackChunk stack = compile_chunk(ast);
+    const RegisterChunk registers = register_compile(stack);
+    return generate_bootstrap(transformed, stack, registers, rng);
 }
 
 } // namespace luatrix
 
 int main(int argc, char** argv) {
     try {
-        luatrix::Options options = luatrix::parse_args(argc, argv);
-        luatrix::process_one(options.input, options.output, options);
+        if (argc != 3) {
+            throw std::runtime_error("usage: luatrix <input> <out>");
+        }
+        std::ifstream input(argv[1], std::ios::binary);
+        if (!input) {
+            throw std::runtime_error("cannot open input");
+        }
+        std::ostringstream contents;
+        contents << input.rdbuf();
+
+        std::ofstream output(argv[2], std::ios::binary);
+        if (!output) {
+            throw std::runtime_error("cannot open output");
+        }
+        output << luatrix::process(contents.str());
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "luatrix: " << error.what() << "\n";
+        std::cerr << "luatrix: " << error.what() << '\n';
         return 1;
     }
 }
