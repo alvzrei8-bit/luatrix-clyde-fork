@@ -1162,7 +1162,7 @@ static std::string generate_bootstrap(const std::string& source,
             "if __lx_debug and __lx_type(__lx_debug)==\"table\" "
             "and __lx_type(__lx_debug.gethook)==\"function\" then "
             "local hook_ok,hook_fn,hook_mask,hook_count=__lx_pcall(__lx_debug.gethook);"
-            "if hook_ok and (hook_fn~=nil or (hook_mask~=nil and hook_mask~="") or (hook_count~=nil and hook_count>0)) then "
+            "if hook_ok and (hook_fn~=nil or (hook_mask~=nil and hook_mask~=\"\") or (hook_count~=nil and hook_count>0)) then "
             "error(\"x\") end end;return true end;";
     code << "local __lx_ids={";
     for (std::size_t i = 0; i < mapping.size(); ++i) {
